@@ -1,0 +1,94 @@
+# SWE-bench Simple: Instance Image
+# This follows full_validation.py workflow exactly
+# Variables to be filled: {PYTHON_VERSION}, {REPO_URL}, {BASE_COMMIT}, {REPO_NAME}
+
+FROM sweb.simple.base:latest
+
+# Create conda environment with specific Python version (like full_validation.py line 349)
+ARG PYTHON_VERSION
+RUN conda create -n testbed python=${PYTHON_VERSION} --override-channels -c conda-forge -y -q
+
+# Add testbed to PATH
+ENV PATH="/opt/conda/envs/testbed/bin:$PATH"
+ENV CONDA_DEFAULT_ENV=testbed
+
+# Clone repository (like full_validation.py line 1176)
+ARG REPO_URL
+ARG REPO_NAME
+RUN git clone ${REPO_URL} /testbed
+WORKDIR /testbed
+
+# Checkout base commit (like full_validation.py)
+ARG BASE_COMMIT
+RUN git checkout ${BASE_COMMIT}
+
+# Set environment variables for building (like full_validation.py)
+ARG CFLAGS=""
+ENV CFLAGS="${CFLAGS}"
+
+# For matplotlib, install required C libraries (freetype, libpng, pkg-config)
+# This is required BEFORE installing matplotlib to ensure ft2font extension builds correctly
+# Following full_validation.py lines 839-862 but using apt-get for reliability
+# Also install ninja for meson-python build backend (matplotlib 3.8+)
+ARG REPO_NAME
+ARG CREATED_AT=""
+RUN if [ "$REPO_NAME" = "matplotlib" ]; then \
+        echo "→ Installing freetype, libpng, pkg-config, and ninja for matplotlib"; \
+        apt-get update -qq && \
+        apt-get install -y -qq \
+            pkg-config \
+            libfreetype6-dev \
+            libpng-dev \
+            ninja-build \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Install repo-specific build dependencies
+# This will be added dynamically based on repo detection
+ARG BUILD_DEPS=""
+RUN if [ -n "$BUILD_DEPS" ]; then \
+        echo "$BUILD_DEPS" | tr ' ' '\n' | grep -E '^setuptools[<>=]' > /constraints.txt || true; \
+        if [ -s /constraints.txt ]; then \
+            export PIP_CONSTRAINT=/constraints.txt; \
+        fi; \
+        /opt/conda/envs/testbed/bin/pip install ${BUILD_DEPS} -q || true; \
+    fi
+
+# Install the package (like full_validation.py line 1180-1185)
+# Use constraints file if exists to prevent setuptools upgrades (like full_validation.py)
+# For meson-python builds (modern matplotlib), remove quiet flag to see build progress
+RUN if [ -s /constraints.txt ]; then export PIP_CONSTRAINT=/constraints.txt; fi && \
+    (/opt/conda/envs/testbed/bin/pip install -e . --no-build-isolation -q || \
+     /opt/conda/envs/testbed/bin/pip install -e . -q || \
+     /opt/conda/envs/testbed/bin/pip install -e . --no-build-isolation || \
+     /opt/conda/envs/testbed/bin/pip install -e . || \
+     /opt/conda/envs/testbed/bin/python setup.py develop -q || true)
+
+# For meson-python projects (matplotlib 3.8+), use non-editable install
+# Editable installs fail at import time due to rebuild-on-import mechanism
+RUN if grep -q "meson-python" pyproject.toml 2>/dev/null; then \
+        echo "→ Detected meson-python build backend, using non-editable install"; \
+        /opt/conda/envs/testbed/bin/pip uninstall matplotlib -y 2>/dev/null || true; \
+        /opt/conda/envs/testbed/bin/pip install . --no-build-isolation 2>&1; \
+        echo "  ✓ Matplotlib installed (non-editable)"; \
+    fi
+
+# Install pytest and plugins (like full_validation.py line 50)
+RUN /opt/conda/envs/testbed/bin/pip install \
+    pytest \
+    pytest-cov \
+    pytest-xdist \
+    -q || true
+
+# Install runtime dependencies
+ARG RUNTIME_DEPS=""
+RUN if [ -n "$RUNTIME_DEPS" ]; then \
+        if [ -s /constraints.txt ]; then export PIP_CONSTRAINT=/constraints.txt; fi; \
+        /opt/conda/envs/testbed/bin/pip install ${RUNTIME_DEPS} -q || true; \
+    fi
+
+# Set environment to use testbed
+ENV CONDA_PREFIX="/opt/conda/envs/testbed"
+
+# Default command
+CMD ["/bin/bash"]

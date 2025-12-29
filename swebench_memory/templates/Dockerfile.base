@@ -1,0 +1,45 @@
+# SWE-bench Simple: Base Image
+# This image contains Ubuntu + Miniconda and is reusable across ALL instances
+# Build once, use forever!
+
+FROM --platform=linux/amd64 ubuntu:22.04
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    wget \
+    curl \
+    build-essential \
+    locales \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set up locale for UTF-8 support (needed for Django Unicode tests)
+RUN locale-gen en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
+
+# Install Miniconda
+RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p /opt/conda && \
+    rm /tmp/miniconda.sh
+
+# Add conda to PATH
+ENV PATH="/opt/conda/bin:$PATH"
+
+# Initialize conda
+RUN conda init bash
+
+# Accept conda Terms of Service
+RUN conda config --set channel_priority flexible && \
+    conda config --add channels conda-forge && \
+    conda config --set always_yes true
+
+# Set working directory
+WORKDIR /workspace
+
+# Default command
+CMD ["/bin/bash"]
