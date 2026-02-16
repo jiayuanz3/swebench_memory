@@ -1,0 +1,51 @@
+{
+  "repo": "sympy/sympy",
+  "pull_number": 11381,
+  "instance_id": "sympy__sympy-11286",
+  "issue_numbers": [
+    "11286"
+  ],
+  "base_commit": "560b22fd4346d5882af3cff32c259a3af8fab109",
+  "patch": "diff --git a/AUTHORS b/AUTHORS\nindex 6d6bbe9aaced..bf502039f629 100644\n--- a/AUTHORS\n+++ b/AUTHORS\n@@ -513,3 +513,4 @@ Abhishek Garg <abhishekgarg119@gmail.com>\n Dana Jacobsen <dana@acm.org>\n Vasiliy Dommes <vasdommes@gmail.com>\n Krit Karan <kritkaran.b13@iiits.in>\n+Rahul Dandwate <rahul02013@gmail.com>\ndiff --git a/sympy/printing/octave.py b/sympy/printing/octave.py\nindex 9fa66d4d730b..f72c7888070e 100644\n--- a/sympy/printing/octave.py\n+++ b/sympy/printing/octave.py\n@@ -392,6 +392,11 @@ def _print_lowergamma(self, expr):\n                                               self._print(expr.args[0]))\n \n \n+    def _print_sinc(self, expr):\n+        #Note: Divide by pi because Octave implements normalized sinc function.\n+        return \"sinc(%s)\" % self._print(expr.args[0]/S.Pi)\n+\n+\n     def _print_hankel1(self, expr):\n         return \"besselh(%s, 1, %s)\" % (self._print(expr.order),\n                                        self._print(expr.argument))\n",
+  "test_patch": "diff --git a/sympy/printing/tests/test_octave.py b/sympy/printing/tests/test_octave.py\nindex 0907625a8a7c..d28279fbb073 100644\n--- a/sympy/printing/tests/test_octave.py\n+++ b/sympy/printing/tests/test_octave.py\n@@ -1,7 +1,7 @@\n from sympy.core import (S, pi, oo, symbols, Function, Rational, Integer,\n                         Tuple, Symbol)\n from sympy.core import EulerGamma, GoldenRatio, Catalan, Lambda\n-from sympy.functions import Piecewise, sqrt, ceiling, exp, sin, cos\n+from sympy.functions import Piecewise, sqrt, ceiling, exp, sin, cos, sinc\n from sympy.utilities.pytest import raises\n from sympy.utilities.lambdify import implemented_function\n from sympy.matrices import (eye, Matrix, MatrixSymbol, Identity,\n@@ -354,6 +354,12 @@ def test_sparse():\n     )\n \n \n+def test_sinc():\n+    assert mcode(sinc(x)) == 'sinc(x/pi)'\n+    assert mcode(sinc((x + 3))) == 'sinc((x + 3)/pi)'\n+    assert mcode(sinc(pi*(x + 3))) == 'sinc(x + 3)'\n+\n+\n def test_specfun():\n     n = Symbol('n')\n     for f in [besselj, bessely, besseli, besselk]:\n",
+  "problem_statement": "octave(sinc(x)) doesn't work\n```\nIn [9]: octave_code(sinc(x))\nOut[9]: '% Not supported in Octave:\\n% sinc\\nsinc(x)'\n```\n\nOctave does the \"normalized sinc function\" so the desired output is:\n\n```\n'sinc(x/pi)'\n```\n\nHow to start:\n1. clone sympy\n2.  look at #11219, changes should be very similar to the `_print_uppergamma` stuff.\n\n",
+  "hints_text": "Note, these should work too:\n\n```\noctave_code(sinc((x+3)))\n'sinc((x + 3)/pi)'\n\noctave_code(sinc(pi*(x+3)))\n'sinc(x + 3)'\n```\n\nI want to work on this issue.\n\ngreat, send us a PR for comments whenever you can.\n",
+  "created_at": "2016-07-11T15:53:59Z",
+  "version": "1.0",
+  "FAIL_TO_PASS": [
+    "sympy/printing/tests/test_octave.py::test_sinc"
+  ],
+  "PASS_TO_PASS": [
+    "sympy/printing/tests/test_octave.py::test_1_over_x_and_sqrt",
+    "sympy/printing/tests/test_octave.py::test_Function",
+    "sympy/printing/tests/test_octave.py::test_Integer",
+    "sympy/printing/tests/test_octave.py::test_Matrices",
+    "sympy/printing/tests/test_octave.py::test_MatrixSymbol",
+    "sympy/printing/tests/test_octave.py::test_Pow",
+    "sympy/printing/tests/test_octave.py::test_Rational",
+    "sympy/printing/tests/test_octave.py::test_basic_ops",
+    "sympy/printing/tests/test_octave.py::test_boolean",
+    "sympy/printing/tests/test_octave.py::test_constants",
+    "sympy/printing/tests/test_octave.py::test_constants_other",
+    "sympy/printing/tests/test_octave.py::test_containers",
+    "sympy/printing/tests/test_octave.py::test_haramard",
+    "sympy/printing/tests/test_octave.py::test_imag",
+    "sympy/printing/tests/test_octave.py::test_mix_number_mult_symbols",
+    "sympy/printing/tests/test_octave.py::test_mix_number_pow_symbols",
+    "sympy/printing/tests/test_octave.py::test_octave_boolean",
+    "sympy/printing/tests/test_octave.py::test_octave_matrix_1x1",
+    "sympy/printing/tests/test_octave.py::test_octave_matrix_assign_to",
+    "sympy/printing/tests/test_octave.py::test_octave_matrix_assign_to_more",
+    "sympy/printing/tests/test_octave.py::test_octave_matrix_elements",
+    "sympy/printing/tests/test_octave.py::test_octave_noninline",
+    "sympy/printing/tests/test_octave.py::test_octave_not_supported",
+    "sympy/printing/tests/test_octave.py::test_octave_piecewise",
+    "sympy/printing/tests/test_octave.py::test_octave_piecewise_times_const",
+    "sympy/printing/tests/test_octave.py::test_sparse",
+    "sympy/printing/tests/test_octave.py::test_specfun",
+    "sympy/printing/tests/test_octave.py::test_special_matrices",
+    "sympy/printing/tests/test_octave.py::test_trick_indent_with_end_else_words",
+    "sympy/printing/tests/test_octave.py::test_vector_entries_hadamard"
+  ],
+  "environment_setup_commit": "560b22fd4346d5882af3cff32c259a3af8fab109"
+}

@@ -456,6 +456,75 @@ def run_specific_tests_in_container(
     return status_map
 
 
+def find_docker_image(instance_id: str, auto_pull: bool = True) -> str:
+    """
+    Find Docker image for instance using multiple naming patterns
+
+    Tries the following patterns in order:
+    1. sweb.simple.<instance_id with __ -> .>:latest (default SWE-bench format)
+    2. jiayuanz3/memory:<instance_id with _ and __ -> .> (user's custom format)
+    3. Any image with tag matching instance_id pattern
+    4. If auto_pull=True and not found, pull from jiayuanz3/memory
+
+    Args:
+        instance_id: Instance ID (e.g., "astropy__astropy-4973")
+        auto_pull: If True, automatically pull missing images from jiayuanz3/memory
+
+    Returns:
+        Image tag if found, None otherwise
+    """
+    # Pattern 1: Default SWE-bench naming
+    default_tag = f"sweb.simple.{instance_id.replace('__', '.')}:latest"
+    result = subprocess.run(
+        ["docker", "images", "-q", default_tag],
+        capture_output=True,
+        text=True
+    )
+    if result.stdout.strip():
+        return default_tag
+
+    # Pattern 2: jiayuanz3/memory format (replace __ with .)
+    # Convert: astropy__astropy-4973 -> astropy.astropy-4973
+    memory_tag = f"jiayuanz3/memory:{instance_id.replace('__', '.')}"
+    result = subprocess.run(
+        ["docker", "images", "-q", memory_tag],
+        capture_output=True,
+        text=True
+    )
+    if result.stdout.strip():
+        return memory_tag
+
+    # Pattern 3: Search all images for matching tag
+    # Get all docker images and search for instance_id pattern
+    result = subprocess.run(
+        ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode == 0:
+        instance_pattern = instance_id.replace('__', '.')
+        for line in result.stdout.strip().split('\n'):
+            if instance_pattern in line:
+                return line.strip()
+
+    # Pattern 4: Auto-pull from jiayuanz3/memory if not found locally
+    if auto_pull:
+        print(f"  → Image not found locally, pulling from Docker Hub...")
+        pull_result = subprocess.run(
+            ["docker", "pull", memory_tag],
+            capture_output=True,
+            text=True
+        )
+        if pull_result.returncode == 0:
+            print(f"  ✓ Successfully pulled: {memory_tag}")
+            return memory_tag
+        else:
+            print(f"  ✗ Failed to pull image: {memory_tag}")
+            print(f"    Error: {pull_result.stderr[:200]}")
+
+    return None
+
+
 def compare_results(
     before: Dict[str, str],
     after: Dict[str, str],
@@ -534,33 +603,25 @@ def evaluate_instance(
     execution_log.append(f"Run ID: {run_id}")
     execution_log.append(f"{'='*60}\n")
 
-    # Get image tag
-    image_tag = f"sweb.simple.{instance_id.replace('__', '.')}:latest"
+    # Find Docker image using smart detection
+    execution_log.append(f"Searching for Docker image for instance: {instance_id}")
+    image_tag = find_docker_image(instance_id)
 
-    # Write model patch to patch.diff (with Python 3 sanitization)
-    model_patch = prediction.get('model_patch', prediction.get('patch', ''))
-    original_patch = model_patch
-    model_patch = _sanitize_patch_for_python3(model_patch or '')
+    if not image_tag:
+        # Try to provide helpful error message
+        expected_tag = f"sweb.simple.{instance_id.replace('__', '.')}:latest"
+        alt_tag = f"jiayuanz3/memory:{instance_id.replace('__', '.')}"
 
-    patch_file.write_text(model_patch or '')
-    execution_log.append(f"Model patch written to {patch_file}")
+        print(f"✗ Image not found for instance: {instance_id}")
+        print(f"  Expected one of:")
+        print(f"    - {expected_tag}")
+        print(f"    - {alt_tag}")
+        print(f"    - Any image with tag containing '{instance_id.replace('__', '.')}'")
 
-    # Log if sanitization was applied
-    if original_patch != model_patch and model_patch:
-        execution_log.append(f"  ⚠ Sanitized for Python 3 compatibility (e.message → str(e))")
-        print(f"  ⚠ Sanitized for Python 3 compatibility (e.message → str(e))")
-
-    # Check if image exists
-    execution_log.append(f"Checking for Docker image: {image_tag}")
-    result = subprocess.run(
-        ["docker", "images", "-q", image_tag],
-        capture_output=True,
-        text=True
-    )
-    if not result.stdout.strip():
-        print(f"✗ Image not found: {image_tag}")
-        execution_log.append(f"ERROR: Image not found: {image_tag}")
-        error_msg = f"Image not found: {image_tag}"
+        execution_log.append(f"ERROR: No Docker image found for {instance_id}")
+        execution_log.append(f"  Tried: {expected_tag}")
+        execution_log.append(f"  Tried: {alt_tag}")
+        error_msg = f"Image not found for instance: {instance_id}"
 
         # Write logs before returning
         run_instance_log.write_text("\n".join(execution_log))
@@ -574,6 +635,20 @@ def evaluate_instance(
         return report
 
     execution_log.append(f"✓ Image found: {image_tag}")
+    print(f"→ Using Docker image: {image_tag}")
+
+    # Write model patch to patch.diff (with Python 3 sanitization)
+    model_patch = prediction.get('model_patch', prediction.get('patch', ''))
+    original_patch = model_patch
+    model_patch = _sanitize_patch_for_python3(model_patch or '')
+
+    patch_file.write_text(model_patch or '')
+    execution_log.append(f"Model patch written to {patch_file}")
+
+    # Log if sanitization was applied
+    if original_patch != model_patch and model_patch:
+        execution_log.append(f"  ⚠ Sanitized for Python 3 compatibility (e.message → str(e))")
+        print(f"  ⚠ Sanitized for Python 3 compatibility (e.message → str(e))")
 
     # Get test lists from instance
     fail_to_pass_tests = instance.get('FAIL_TO_PASS', [])
@@ -679,7 +754,12 @@ git apply /patch.diff
     output_log = []
 
     # Step 1: Apply test_patch (if exists)
-    test_patched_image = image_tag.replace(":latest", f":{run_id}_testpatch")
+    # Create unique name for test-patched image (handle tags with or without :latest)
+    if ":latest" in image_tag:
+        test_patched_image = image_tag.replace(":latest", f":{run_id}_testpatch")
+    else:
+        # For tags like jiayuanz3/memory:astropy.astropy-4973
+        test_patched_image = f"{image_tag}_{run_id}_testpatch"
 
     if test_patch:
         print(f"→ Applying test patch...")
@@ -741,6 +821,33 @@ git apply /patch.diff
                     subprocess.run(["docker", "commit", reinstall_container, test_patched_image], capture_output=True)
                     print(f"    ✓ Package reinstalled")
                     execution_log.append(f"    ✓ Package reinstalled successfully")
+
+                subprocess.run(["docker", "rm", "-f", reinstall_container], capture_output=True)
+
+            # For pytest repos: Reinstall in editable mode after test_patch to generate _pytest._version
+            # The test_patch includes code changes that need to be part of the installed package
+            is_pytest = 'pytest' in repo.lower() and repo.split('/')[-1] == 'pytest'
+            if is_pytest:
+                print(f"  → Reinstalling pytest in editable mode after test_patch...")
+                execution_log.append(f"  → Reinstalling pytest to regenerate version module")
+
+                reinstall_cmd = "cd /testbed && /opt/conda/envs/testbed/bin/pip install -e . --no-deps -q"
+                reinstall_container = f"reinstall_pytest_{instance_id.replace('/', '_').replace('__', '_')}"
+                subprocess.run(["docker", "rm", "-f", reinstall_container], capture_output=True)
+
+                reinstall_result = subprocess.run(
+                    ["docker", "run", "--name", reinstall_container, test_patched_image, "bash", "-c", reinstall_cmd],
+                    capture_output=True,
+                    text=True
+                )
+
+                if reinstall_result.returncode == 0:
+                    subprocess.run(["docker", "commit", reinstall_container, test_patched_image], capture_output=True)
+                    print(f"    ✓ Pytest reinstalled in editable mode")
+                    execution_log.append(f"    ✓ Pytest reinstalled successfully")
+                else:
+                    print(f"    ⚠ Pytest reinstall failed")
+                    execution_log.append(f"    ⚠ Pytest reinstall returned code {reinstall_result.returncode}")
 
                 subprocess.run(["docker", "rm", "-f", reinstall_container], capture_output=True)
 
@@ -816,7 +923,12 @@ git apply /patch.diff
     output_log.append("=" * 60)
 
     cmd_apply_model = f"cd /testbed && cat <<'PATCH_EOF' | git apply -\n{model_patch}\nPATCH_EOF"
-    model_patched_image = image_tag.replace(":latest", f":{run_id}_patched")
+    # Create unique name for model-patched image (handle tags with or without :latest)
+    if ":latest" in image_tag:
+        model_patched_image = image_tag.replace(":latest", f":{run_id}_patched")
+    else:
+        # For tags like jiayuanz3/memory:astropy.astropy-4973
+        model_patched_image = f"{image_tag}_{run_id}_patched"
     container_name = f"apply_patch_{instance_id.replace('/', '_').replace('__', '_')}"
 
     subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
@@ -938,6 +1050,15 @@ git apply /patch.diff
         execution_log.append(f"  Removed: {test_patched_image}")
     subprocess.run(["docker", "rmi", model_patched_image], capture_output=True)
     execution_log.append(f"  Removed: {model_patched_image}")
+
+    # Delete instance image (but keep jiayuanz3/memory:base)
+    if image_tag != "jiayuanz3/memory:base":
+        subprocess.run(["docker", "rmi", image_tag], capture_output=True)
+        execution_log.append(f"  Removed: {image_tag}")
+        print(f"  ✓ Cleaned up instance image: {image_tag}")
+    else:
+        execution_log.append(f"  Kept: {image_tag} (base image)")
+        print(f"  ✓ Kept base image: {image_tag}")
 
     # Create report
     execution_log.append(f"\nEvaluation results:")
@@ -1070,7 +1191,7 @@ def main():
         report[result['instance_id']] = result
 
     # Write summary report
-    output_file = f"GT.{args.run_id}.json"
+    output_file = f"{args.run_id}.json"
     with open(output_file, 'w') as f:
         json.dump(report, f, indent=2)
 

@@ -74,14 +74,11 @@ RUN if grep -q "meson-python" pyproject.toml 2>/dev/null; then \
     fi
 
 # Install pytest and plugins (like full_validation.py line 50)
-# Skip if this IS a pytest repo (already installed in editable mode above)
-RUN if [ "$REPO_NAME" != "pytest" ]; then \
-        /opt/conda/envs/testbed/bin/pip install \
-            pytest \
-            pytest-cov \
-            pytest-xdist \
-            -q || true; \
-    fi
+RUN /opt/conda/envs/testbed/bin/pip install \
+    pytest \
+    pytest-cov \
+    pytest-xdist \
+    -q || true
 
 # Install runtime dependencies
 ARG RUNTIME_DEPS=""
