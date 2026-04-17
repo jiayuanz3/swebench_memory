@@ -26,6 +26,22 @@ RUN git checkout ${BASE_COMMIT}
 ARG CFLAGS=""
 ENV CFLAGS="${CFLAGS}"
 
+# Install graphviz for Sphinx repos (needed for inheritance_diagram tests that use
+# the if_graphviz_found fixture — without the 'dot' binary all graphviz tests are skipped)
+RUN if [ "$REPO_NAME" = "sphinx" ]; then \
+        apt-get update -qq && \
+        apt-get install -y -qq graphviz && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Install PostgreSQL for Django repos (needed for PostgreSQL-specific tests)
+RUN if [ "$REPO_NAME" = "django" ]; then \
+        apt-get update -qq && \
+        apt-get install -y -qq postgresql && \
+        rm -rf /var/lib/apt/lists/* && \
+        /opt/conda/envs/testbed/bin/pip install psycopg2-binary -q || true; \
+    fi
+
 # For matplotlib, install required C libraries (freetype, libpng, pkg-config)
 # This is required BEFORE installing matplotlib to ensure ft2font extension builds correctly
 # Following full_validation.py lines 839-862 but using apt-get for reliability
@@ -47,11 +63,12 @@ RUN if [ "$REPO_NAME" = "matplotlib" ]; then \
 # This will be added dynamically based on repo detection
 ARG BUILD_DEPS=""
 RUN if [ -n "$BUILD_DEPS" ]; then \
-        echo "$BUILD_DEPS" | tr ' ' '\n' | grep -E '^setuptools[<>=]' > /constraints.txt || true; \
+        echo "$BUILD_DEPS" | tr ' ' '\n' > /build_deps.txt; \
+        grep -E '^setuptools[<>=]' /build_deps.txt > /constraints.txt || true; \
         if [ -s /constraints.txt ]; then \
             export PIP_CONSTRAINT=/constraints.txt; \
         fi; \
-        /opt/conda/envs/testbed/bin/pip install ${BUILD_DEPS} -q || true; \
+        /opt/conda/envs/testbed/bin/pip install -r /build_deps.txt -q || true; \
     fi
 
 # Install the package (like full_validation.py line 1180-1185)

@@ -66,27 +66,35 @@ def main():
     predictions = load_all_json_files(args.predictions, verbose=False)
     print(f"✓ Loaded {len(predictions)} prediction(s)")
 
-    # Get instance IDs from predictions
-    prediction_instance_ids = set()
+    # Get instance IDs from predictions (preserve originals, also build lowercase lookup)
+    prediction_instance_ids = {}  # lowercase -> original
     for pred in predictions:
         if 'instance_id' in pred:
-            prediction_instance_ids.add(pred['instance_id'])
+            prediction_instance_ids[pred['instance_id'].lower()] = pred['instance_id']
 
     # Load all instances (silently)
     all_instances = load_all_json_files(args.instances, verbose=False)
 
-    # Filter instances to only include those with predictions
+    # Filter instances to only include those with predictions (case-insensitive match)
+    # Also normalize instance_id to match the prediction's casing
     filtered_instances = []
+    matched_pred_ids_lower = set()
     for instance in all_instances:
-        if 'instance_id' in instance and instance['instance_id'] in prediction_instance_ids:
-            filtered_instances.append(instance)
-            print(f"✓ Matched: {instance['instance_id']}")
+        if 'instance_id' in instance:
+            lower_id = instance['instance_id'].lower()
+            if lower_id in prediction_instance_ids:
+                # Normalize instance_id to match prediction casing
+                canonical_id = prediction_instance_ids[lower_id]
+                instance = dict(instance)
+                instance['instance_id'] = canonical_id
+                filtered_instances.append(instance)
+                matched_pred_ids_lower.add(lower_id)
+                print(f"✓ Matched: {canonical_id}")
 
     # Check for predictions without matching instances
-    instance_ids = {inst['instance_id'] for inst in filtered_instances}
-    for pred_id in prediction_instance_ids:
-        if pred_id not in instance_ids:
-            print(f"⚠ No instance file found for prediction: {pred_id}")
+    for lower_id, orig_id in prediction_instance_ids.items():
+        if lower_id not in matched_pred_ids_lower:
+            print(f"⚠ No instance file found for prediction: {orig_id}")
 
     # Write combined files (silently)
     with open(args.dataset_output, 'w') as f:

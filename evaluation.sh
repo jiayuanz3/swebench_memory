@@ -5,8 +5,17 @@ set -e
 
 # Configuration
 RUN_ID="${1:-batch_baseline}"
-INSTANCES_DIR="${2:-cases}"
 PREDICTIONS_DIR="${3:-predictions}"
+
+# Select instances directory based on optional second argument
+case "${2:-}" in
+    lite)         INSTANCES_DIR="cases/SWEContextBench Lite" ;;
+    multilingual) INSTANCES_DIR="cases/SWEContextBench Multilingual" ;;
+    verified)     INSTANCES_DIR="cases/SWEContextBench Verified" ;;
+    full)         INSTANCES_DIR="cases/SWEContextBench Full" ;;
+    "")           INSTANCES_DIR="cases" ;;
+    *)            echo "Unknown subset '${2}'. Use: lite, multilingual, verified, full, or omit for all."; exit 1 ;;
+esac
 DATASET_FILE="batch_dataset.json"
 PREDICTIONS_FILE="batch_predictions.json"
 

@@ -16,12 +16,13 @@ from pathlib import Path
 BASE_IMAGE_TAG = "sweb.simple.base:latest"
 
 
-def build_base_image(force_rebuild: bool = False) -> bool:
+def build_base_image(force_rebuild: bool = False, arch: str = "x86_64") -> bool:
     """
     Build the base Docker image
 
     Args:
         force_rebuild: If True, rebuild even if image exists
+        arch: Target architecture ("x86_64" or "arm64"), default "x86_64"
 
     Returns:
         True if successful, False otherwise
@@ -55,10 +56,15 @@ def build_base_image(force_rebuild: bool = False) -> bool:
     print()
 
     # Build the image
+    # Use buildx with --load to produce a simple single-platform manifest (not a manifest list).
+    # This ensures docker push creates a plain manifest pullable from any machine.
+    platform = "linux/arm64/v8" if arch == "arm64" else "linux/amd64"
     result = subprocess.run(
         [
-            "docker", "build",
-            "--platform", "linux/amd64",
+            "docker", "buildx", "build",
+            "--platform", platform,
+            "--provenance=false",
+            "--load",
             "-f", str(dockerfile_path),
             "-t", BASE_IMAGE_TAG,
             str(script_dir / "templates")
@@ -91,10 +97,16 @@ def main():
         action="store_true",
         help="Force rebuild even if image exists"
     )
+    parser.add_argument(
+        "--arch",
+        default="x86_64",
+        choices=["x86_64", "arm64"],
+        help="Target architecture (default: x86_64)"
+    )
 
     args = parser.parse_args()
 
-    success = build_base_image(force_rebuild=args.force_rebuild)
+    success = build_base_image(force_rebuild=args.force_rebuild, arch=args.arch)
     sys.exit(0 if success else 1)
 
 

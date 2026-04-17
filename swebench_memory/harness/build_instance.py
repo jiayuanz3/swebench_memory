@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Build instance Docker images following full_validation.py workflow
+Build instance Docker images for all 8 supported languages.
 
 This script:
-1. Detects Python version from repo
-2. Detects dependencies based on repo type
-3. Builds a Docker image following full_validation.py steps exactly
+1. Detects language from repo marker files (Cargo.toml, go.mod, pom.xml, etc.)
+2. Detects the required language version from project files, with date-based fallback
+3. Builds a Docker image using the language-specific Dockerfile template
 
-Platform: Ubuntu 22.04 + gcc 11 (Linux)
-Note: Adapted from full_validation.py which runs on macOS + clang
+Platform: Ubuntu 22.04 + gcc 11 (Linux/amd64) — all Docker images target linux/amd64.
+Note: Python path adapted from full_validation.py (macOS/clang); other languages target Linux directly.
 
 Usage:
     python -m swebench_memory.harness.build_instance --dataset_name cases/sympy__sympy-9123/sympy__sympy-9123.json
@@ -23,7 +23,6 @@ import tempfile
 from pathlib import Path
 from typing import List, Tuple
 
-
 BASE_IMAGE_TAG = "sweb.simple.base:latest"
 
 
@@ -36,6 +35,25 @@ class RepoConfig:
     def __init__(self, repo: str):
         self.repo = repo.lower()
         self.repo_name = repo.split('/')[-1]
+
+    def get_package_name(self) -> str:
+        """Get the importable Python package name for this repo"""
+        mappings = {
+            'scikit-learn': 'sklearn',
+            'pytest': 'pytest',
+            'requests': 'requests',
+            'seaborn': 'seaborn',
+            'matplotlib': 'matplotlib',
+            'django': 'django',
+            'astropy': 'astropy',
+            'sympy': 'sympy',
+            'xarray': 'xarray',
+            'pylint': 'pylint',
+        }
+        for key, value in mappings.items():
+            if key in self.repo:
+                return value
+        return self.repo_name.replace('-', '_')
 
     def get_build_deps(self) -> List[str]:
         """Get build-time dependencies (fallback if not found in pyproject.toml/setup.py)"""
@@ -108,11 +126,44 @@ class RepoConfig:
             except (ValueError, IndexError):
                 pyparsing_dep = 'pyparsing>=2.3.1,<3.1'
 
-            return ['numpy<2', 'pillow', pyparsing_dep, 'python-dateutil', 'cycler', 'pandas']
+            # Old matplotlib (pre-2021) uses np.float in polar.py; NumPy >=1.20 raises
+            # DeprecationWarning (error via filterwarnings=error). NumPy >=1.19 also adds
+            # VisibleDeprecationWarning for ragged-sequence ndarrays in test code.
+            # Pin numpy<1.19 for old commits — mirrors full_validation.py lines 966-985.
+            if commit_date < "2021-01-01":
+                numpy_dep = 'numpy<1.19'
+            else:
+                numpy_dep = 'numpy<2'
+
+            return [numpy_dep, 'pillow', pyparsing_dep, 'python-dateutil', 'cycler', 'pandas']
         elif 'seaborn' in self.repo:
             return ['numpy<2', 'pandas', 'matplotlib']
         elif 'astropy' in self.repo:
-            return ['numpy<2', 'scipy', 'pytest-astropy', 'pytest-doctestplus']
+            try:
+                year = int(commit_date.split('-')[0])
+            except (ValueError, IndexError):
+                year = 2020
+            # Old astropy (pre-2022) uses nose-style setup(self)/teardown(self) fixtures,
+            # which pytest 7+ treats as a hard error (PytestRemovedIn8Warning).
+            # Newer astropy requires pytest>=7 (setup.cfg minversion = 7.0).
+            if year < 2022:
+                pytest_dep = 'pytest<7'
+            else:
+                pytest_dep = 'pytest'
+            return ['numpy<2', 'scipy', 'pytest-astropy', 'pytest-doctestplus', pytest_dep]
+        elif 'sphinx' in self.repo:
+            # Jinja2 3.0 (released May 2021) removed environmentfilter/contextfilter/evalcontextfilter.
+            # Sphinx 4.0 (April 2021) added Jinja2 3.0 support via pass_environment etc.
+            # Pin jinja2<3.0 for sphinx commits before Sphinx 4.0 era.
+            try:
+                year = int(commit_date.split('-')[0])
+                month = int(commit_date.split('-')[1])
+            except (ValueError, IndexError):
+                year, month = 2020, 1
+            if year < 2021 or (year == 2021 and month < 5):
+                # markupsafe 2.0 removed soft_unicode which jinja2<3.0 uses
+                return ['jinja2<3.0', 'markupsafe<2.0', 'docutils<0.17', 'html5lib']
+            return ['html5lib']
         elif 'django' in self.repo:
             # tzdata is required for Django 3.2+ with zoneinfo/backports.zoneinfo
             return ['pytz', 'sqlparse', 'asgiref', 'tzdata']
@@ -204,7 +255,42 @@ class RepoConfig:
 """
                 fixes.append(("SymPy pytest compatibility (fix py.test.mark for pytest 7+)", pytest_fix_old))
             else:
-                # For newer SymPy (2017+): fix with _pytest imports
+                # For newer SymPy (2017+): try two variants of the fix depending on
+                # which era of pytest.py the commit uses.
+                # Variant A: 2015-2018 era - uses "from py.test import skip, raises"
+                # and has a custom skip() that raises Skipped (not recognized by pytest).
+                # This fix replaces skip() with pytest.skip() and fixes py.test.mark refs.
+                # (String concatenated to avoid triple-quote collision with the hunk context.)
+                pytest_fix_py_test = (
+                    "diff --git a/sympy/utilities/pytest.py b/sympy/utilities/pytest.py\n"
+                    "index f2ab9e7d3b..871b1cad94 100644\n"
+                    "--- a/sympy/utilities/pytest.py\n"
+                    "+++ b/sympy/utilities/pytest.py\n"
+                    "@@ -126,7 +126,7 @@ def wrapper():\n"
+                    "         wrapper = functools.update_wrapper(wrapper, func)\n"
+                    "         return wrapper\n"
+                    " \n"
+                    "-    def skip(str):\n"
+                    "-        raise Skipped(str)\n"
+                    "+    def skip(reason):\n"
+                    "+        import pytest as _pm; _pm.skip(reason)\n"
+                    " \n"
+                    "     def SKIP(reason):\n"
+                    "@@ -151,8 +151,9 @@ def func_wrapper():\n"
+                    "         return func_wrapper\n"
+                    " \n"
+                    " else:\n"
+                    "-    XFAIL = py.test.mark.xfail\n"
+                    "-    slow = py.test.mark.slow\n"
+                    "+    import pytest as _pm\n"
+                    "+    XFAIL = _pm.mark.xfail\n"
+                    "+    slow = _pm.mark.slow\n"
+                    " \n"
+                    "     def SKIP(reason):\n"
+                    "         def skipping(func):\n"
+                )
+                fixes.append(("SymPy pytest compatibility (fix py.test.mark and skip for pytest 7+, py.test era)", pytest_fix_py_test))
+                # Variant B: post-2018 era - uses "_pytest" imports directly
                 pytest_fix = """diff --git a/sympy/utilities/pytest.py b/sympy/utilities/pytest.py
 --- a/sympy/utilities/pytest.py
 +++ b/sympy/utilities/pytest.py
@@ -230,6 +316,65 @@ class RepoConfig:
          def skipping(func):
 """
                 fixes.append(("SymPy pytest compatibility (fix py.test.mark for pytest 7+)", pytest_fix))
+                # Variant C: 2019-2021 era - has SKIP/nocache_fail in else branch too
+                # (added contextlib/warns imports, extra py.test.mark attributes)
+                pytest_fix_2020 = (
+                    "diff --git a/sympy/utilities/pytest.py b/sympy/utilities/pytest.py\n"
+                    "index 400001e1ce..9e9c66d65c 100644\n"
+                    "--- a/sympy/utilities/pytest.py\n"
+                    "+++ b/sympy/utilities/pytest.py\n"
+                    "@@ -201,10 +201,11 @@ def warns(warningcls, **kwargs):\n"
+                    " \n"
+                    " \n"
+                    " else:\n"
+                    "-    XFAIL = py.test.mark.xfail\n"
+                    "-    SKIP = py.test.mark.skip\n"
+                    "-    slow = py.test.mark.slow\n"
+                    "-    nocache_fail = py.test.mark.nocache_fail\n"
+                    "+    import pytest as _pm\n"
+                    "+    XFAIL = _pm.mark.xfail\n"
+                    "+    SKIP = _pm.mark.skip\n"
+                    "+    slow = _pm.mark.slow\n"
+                    "+    nocache_fail = _pm.mark.nocache_fail\n"
+                    " \n"
+                    " \n"
+                    " @contextlib.contextmanager\n"
+                )
+                fixes.append(("SymPy pytest compatibility (fix py.test.mark for pytest 7+, 2020 era)", pytest_fix_2020))
+
+        # Astropy: np.rank removed in NumPy 1.15; np.asscalar removed in NumPy 1.24.
+        # Old astropy (pre-2019-06) still references these in function_helpers.py,
+        # causing an AttributeError at import time when running with newer NumPy.
+        if 'astropy/astropy' in self.repo and commit_date < '2020-01-01':
+            astropy_nprank_fix = """diff --git a/astropy/units/quantity_helper/function_helpers.py b/astropy/units/quantity_helper/function_helpers.py
+--- a/astropy/units/quantity_helper/function_helpers.py
++++ b/astropy/units/quantity_helper/function_helpers.py
+@@ -128,6 +128,6 @@ UNSUPPORTED_FUNCTIONS |= {
+ # variable so that we can check consistency in the test routine -
+ # test_quantity_non_ufuncs.py)
+-IGNORED_FUNCTIONS = {
+-    # Deprecated
+-    np.rank, np.asscalar,
++_np_rank = getattr(np, 'rank', None)
++_np_asscalar = getattr(np, 'asscalar', None)
++IGNORED_FUNCTIONS = set(f for f in [_np_rank, _np_asscalar] if f is not None) | {
+     # I/O - useless for Quantity, since no way to store the unit.
+"""
+            fixes.append(("Astropy np.rank/np.asscalar compatibility (removed in newer NumPy)", astropy_nprank_fix))
+
+            # pytest-doctestplus 0.9.0 is incompatible with pytest 7.x:
+            # _getconftest_pathlist() missing 'rootpath' argument.
+            # Disable the plugin via setup.cfg addopts to allow collection.
+            astropy_doctestplus_fix = """diff --git a/setup.cfg b/setup.cfg
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -102,3 +102,3 @@ remote_data_strict = true
+ remote_data_strict = true
+-addopts = -p no:warnings
++addopts = -p no:warnings -p no:doctestplus
+ asdf_schema_root = astropy/io/misc/asdf/data/schemas
+"""
+            fixes.append(("Astropy pytest-doctestplus 0.9.0/pytest-7 compatibility", astropy_doctestplus_fix))
 
         # Django: HTMLParseError compatibility fix (needed before Django 1.9, ~2015-12-01)
         if 'django/django' in self.repo and commit_date < '2015-12-01':
@@ -477,9 +622,320 @@ def detect_python_version(repo_dir: Path, created_at: str) -> str:
         return "3.7"
 
 
+# ============================================================================
+# LANGUAGE DETECTION AND NON-PYTHON VERSION DETECTION
+# ============================================================================
+
+def detect_language(repo_dir: Path) -> str:
+    """Detect primary language from repo marker files. Mirrors per-language validator logic."""
+    if (repo_dir / "Cargo.toml").exists():
+        return "rust"
+    if (repo_dir / "go.mod").exists():
+        return "go"
+    if any((repo_dir / f).exists() for f in ["pom.xml", "build.gradle", "build.gradle.kts", "build.xml"]):
+        return "java"
+    if (repo_dir / "composer.json").exists():
+        return "php"
+    # Check Python markers before package.json — some Python repos (e.g. django/django)
+    # ship a package.json for frontend assets but are fundamentally Python projects.
+    if any((repo_dir / f).exists() for f in ["setup.py", "pyproject.toml", "setup.cfg", "manage.py"]):
+        return "python"
+    if (repo_dir / "package.json").exists():
+        return "javascript"
+    if (repo_dir / "Gemfile").exists():
+        return "ruby"
+    has_build_system = any((repo_dir / f).exists() for f in ["Makefile", "CMakeLists.txt", "configure.ac", "Makefile.am"])
+    if has_build_system:
+        c_files = list(repo_dir.glob("*.c")) + list(repo_dir.glob("src/*.c"))
+        if c_files:
+            return "c"
+    return "python"
+
+
+def detect_rust_version(repo_dir: Path, created_at: str) -> str:
+    """Detect Rust version from rust-toolchain or Cargo.toml, with date fallback."""
+    for name in ["rust-toolchain", "rust-toolchain.toml"]:
+        tf = repo_dir / name
+        if tf.exists():
+            content = tf.read_text()
+            m = re.search(r'channel\s*=\s*"(\d+\.\d+)', content)
+            if m:
+                return m.group(1)
+            m = re.search(r'"(\d+\.\d+\.\d+)"', content)
+            if m:
+                return m.group(1)
+    cargo = repo_dir / "Cargo.toml"
+    if cargo.exists():
+        m = re.search(r'rust-version\s*=\s*"(\d+\.\d+)', cargo.read_text())
+        if m:
+            return m.group(1)
+    try:
+        year = int(created_at.split('-')[0])
+    except (ValueError, IndexError):
+        year = 2020
+    if year < 2019:
+        return "1.30"
+    elif year < 2021:
+        return "1.50"
+    elif year < 2023:
+        return "1.60"
+    else:
+        return "1.70"
+
+
+def detect_go_version(repo_dir: Path, created_at: str) -> str:
+    """Detect Go version from go.mod, with date fallback."""
+    go_mod = repo_dir / "go.mod"
+    if go_mod.exists():
+        m = re.search(r'^go\s+(\d+\.\d+)', go_mod.read_text(), re.MULTILINE)
+        if m:
+            return m.group(1)
+    try:
+        year = int(created_at.split('-')[0])
+    except (ValueError, IndexError):
+        year = 2020
+    if year < 2019:
+        return "1.11"
+    elif year < 2021:
+        return "1.13"
+    elif year < 2022:
+        return "1.16"
+    elif year < 2023:
+        return "1.18"
+    elif year < 2024:
+        return "1.20"
+    else:
+        return "1.21"
+
+
+def detect_java_version(repo_dir: Path, created_at: str) -> str:
+    """Detect Java version from pom.xml or build.gradle, with date fallback.
+
+    Collects ALL version hints from the project files (source, target, release),
+    takes the maximum, then maps to the nearest conda-forge-available version:
+      <= 8  → 8
+      9-11  → 11  (conda-forge has no Java 9/10; --release flag needs Java 9+)
+      12-17 → 17
+      18+   → 21
+    """
+    def _normalize(v: str) -> int:
+        """'1.6' → 6, '17.0.1' → 17, '9' → 9"""
+        v = v.strip()
+        if v.startswith('1.') and len(v) >= 3:
+            try:
+                return int(v.split('.')[1])
+            except ValueError:
+                pass
+        try:
+            return int(v.split('.')[0])
+        except ValueError:
+            return 0
+
+    def _to_conda(ver: int) -> str:
+        """Map any Java version to the nearest conda-forge-available openjdk.
+
+        Java 11 is skipped intentionally: conda-forge's openjdk=11.0.1 (2018
+        build) has broken TLS and cannot download plugins from Maven Central.
+        Java 17 is the next LTS, is widely available, and supports --release
+        8 through 17, covering all projects that would have used Java 11.
+        """
+        if ver <= 8:
+            return "8"
+        if ver <= 17:
+            return "17"
+        return "21"
+
+    versions: List[int] = []
+
+    pom = repo_dir / "pom.xml"
+    if pom.exists():
+        content = pom.read_text()
+        # source / target / java.version property (old-style "1.6" or modern "11")
+        for pattern in [
+            r'<maven\.compiler\.source>([\d.]+)',
+            r'<maven\.compiler\.target>([\d.]+)',
+            r'<java\.version>([\d.]+)',
+        ]:
+            for m in re.finditer(pattern, content):
+                v = _normalize(m.group(1))
+                if v > 0:
+                    versions.append(v)
+        # <release>9</release> inside maven-compiler-plugin — requires Java 9+
+        for m in re.finditer(r'<release>(\d+)</release>', content):
+            v = int(m.group(1))
+            if v > 0:
+                versions.append(v)
+
+    for name in ["build.gradle", "build.gradle.kts"]:
+        gf = repo_dir / name
+        if gf.exists():
+            m = re.search(
+                r'(?:sourceCompatibility|targetCompatibility)\s*[=:]\s*["\']?(?:JavaVersion\.VERSION_)?(\d+)["\']?',
+                gf.read_text()
+            )
+            if m:
+                v = _normalize(m.group(1))
+                if v > 0:
+                    versions.append(v)
+
+    if versions:
+        return _to_conda(max(versions))
+
+    # Date-based fallback
+    try:
+        year = int(created_at.split('-')[0])
+    except (ValueError, IndexError):
+        year = 2020
+    if year < 2018:
+        return "8"
+    elif year < 2021:
+        return "11"
+    elif year < 2024:
+        return "17"
+    else:
+        return "21"
+
+
+def detect_php_version(repo_dir: Path, created_at: str) -> str:
+    """Detect PHP version from composer.json, with date fallback."""
+    composer = repo_dir / "composer.json"
+    if composer.exists():
+        try:
+            data = json.loads(composer.read_text())
+            php_req = data.get('require', {}).get('php', '')
+            m = re.search(r'(\d+\.\d+)', php_req)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+    try:
+        year = int(created_at.split('-')[0])
+    except (ValueError, IndexError):
+        year = 2020
+    if year < 2019:
+        return "7.2"
+    elif year < 2021:
+        return "7.4"
+    elif year < 2023:
+        return "8.0"
+    else:
+        return "8.1"
+
+
+def detect_js_version(repo_dir: Path, created_at: str) -> str:
+    """Detect Node.js major version from .nvmrc or package.json, with date fallback."""
+    nvmrc = repo_dir / ".nvmrc"
+    if nvmrc.exists():
+        v = nvmrc.read_text().strip().lstrip('v')
+        m = re.match(r'(\d+)', v)
+        if m:
+            return m.group(1)
+    pkg = repo_dir / "package.json"
+    if pkg.exists():
+        try:
+            data = json.loads(pkg.read_text())
+            engines = data.get('engines', {}).get('node', '')
+            m = re.search(r'(\d+)', engines)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+    try:
+        year = int(created_at.split('-')[0])
+    except (ValueError, IndexError):
+        year = 2020
+    if year < 2019:
+        return "10"
+    elif year < 2021:
+        return "14"
+    elif year < 2023:
+        return "16"
+    else:
+        return "18"
+
+
+def detect_ruby_version(repo_dir: Path, created_at: str) -> str:
+    """Detect Ruby version from .ruby-version or Gemfile, with date fallback."""
+    rv = repo_dir / ".ruby-version"
+    if rv.exists():
+        v = rv.read_text().strip().lstrip('ruby-')
+        m = re.match(r'(\d+\.\d+)', v)
+        if m:
+            return m.group(1)
+    gemfile = repo_dir / "Gemfile"
+    if gemfile.exists():
+        m = re.search(r"ruby\s+['\"]([^'\"]+)", gemfile.read_text())
+        if m:
+            parts = m.group(1).split('.')
+            if len(parts) >= 2:
+                return f"{parts[0]}.{parts[1]}"
+    try:
+        year = int(created_at.split('-')[0])
+    except (ValueError, IndexError):
+        year = 2020
+    if year < 2019:
+        return "2.5"
+    elif year < 2021:
+        return "2.6"
+    elif year < 2022:
+        return "2.7"
+    elif year < 2024:
+        return "3.0"
+    else:
+        return "3.1"
+
+
+def get_language_dockerfile(language: str, script_dir: Path) -> Path:
+    """Get Dockerfile path for the given language. Python uses the existing Dockerfile.instance."""
+    if language == "python":
+        return script_dir / "templates" / "Dockerfile.instance"
+    return script_dir / "templates" / f"Dockerfile.instance.{language}"
+
+
+def _py_extract_imports(patch: str) -> set:
+    """Extract top-level Python package names from import statements in added lines of a patch."""
+    pkgs: set = set()
+    for line in patch.split('\n'):
+        if not line.startswith('+') or line.startswith('+++'):
+            continue
+        m = re.match(r'^\+\s*import\s+([a-zA-Z_][a-zA-Z0-9_]*)', line)
+        if m:
+            pkgs.add(m.group(1))
+            continue
+        m = re.match(r'^\+\s*from\s+([a-zA-Z_][a-zA-Z0-9_]*)', line)
+        if m:
+            pkgs.add(m.group(1))
+    return pkgs
+
+
+def _py_extract_install_requires(patch: str) -> set:
+    """Extract new package names added to install_requires in setup.cfg/pyproject.toml patch."""
+    pkgs: set = set()
+    in_install_requires = False
+    for line in patch.split('\n'):
+        if re.match(r'^\+?\s*install_requires\s*=', line):
+            in_install_requires = True
+            continue
+        if in_install_requires and re.match(r'^\+?\s*\[', line):
+            in_install_requires = False
+            continue
+        if in_install_requires and line.startswith('+') and not line.startswith('+++'):
+            pkg_line = line[1:].strip()
+            if pkg_line and not pkg_line.startswith('#'):
+                m = re.match(r'^([a-zA-Z_][a-zA-Z0-9_.-]*)(?:[>=<!<\[].*)?$', pkg_line)
+                if m:
+                    pkgs.add(m.group(1).lower().replace('-', '_'))
+        if not in_install_requires and line.startswith('+') and not line.startswith('+++'):
+            m = re.match(r'^\+\s{4,}([a-zA-Z_][a-zA-Z0-9_.-]*)(?:[>=<!<\[].*)?$', line)
+            if m:
+                pkgs.add(m.group(1).lower().replace('-', '_'))
+    return pkgs
+
+
 def build_instance_image(
     instance: dict,
-    force_rebuild: bool = False
+    force_rebuild: bool = False,
+    arch: str = "x86_64",
 ) -> Tuple[bool, str]:
     """
     Build a Docker image for a specific instance
@@ -487,6 +943,7 @@ def build_instance_image(
     Args:
         instance: Instance data from dataset JSON
         force_rebuild: If True, rebuild even if image exists
+        arch: Target architecture ("x86_64" or "arm64"), default "x86_64"
 
     Returns:
         (success, image_tag)
@@ -497,7 +954,7 @@ def build_instance_image(
     created_at = instance.get('created_at', '2020-01-01')
 
     # Generate image tag
-    image_tag = f"sweb.simple.{instance_id.replace('__', '.')}:latest"
+    image_tag = f"sweb.simple.{instance_id.replace('__', '.').lower()}:latest"
 
     print("=" * 60)
     print(f"Building instance: {instance_id}")
@@ -526,13 +983,13 @@ def build_instance_image(
         print(f"  Run: python -m swebench_memory.harness.build_base")
         return False, ""
 
-    # Clone repo to detect Python version (like full_validation.py)
-    print("→ Cloning repo to detect Python version...")
+    repo_url = f"https://github.com/{repo}.git"
+
+    # Clone repo to detect language and version
+    print("→ Cloning repo to detect language and version...")
     with tempfile.TemporaryDirectory() as tmpdir:
         repo_dir = Path(tmpdir) / "repo"
-        repo_url = f"https://github.com/{repo}.git"
 
-        # Clone
         result = subprocess.run(
             ["git", "clone", "--depth", "1", repo_url, str(repo_dir)],
             capture_output=True
@@ -541,7 +998,6 @@ def build_instance_image(
             print(f"✗ Failed to clone repo: {repo}")
             return False, ""
 
-        # Fetch and checkout specific commit
         subprocess.run(
             ["git", "fetch", "--depth=100", "origin", base_commit],
             cwd=repo_dir,
@@ -553,53 +1009,107 @@ def build_instance_image(
             capture_output=True
         )
 
-        # Detect Python version
-        python_version = detect_python_version(repo_dir, created_at)
-        print(f"  ✓ Detected Python version: {python_version}")
+        # Detect language
+        language = detect_language(repo_dir)
+        print(f"  ✓ Detected language: {language}")
 
-        # Get build requirements from pyproject.toml/setup.py (like full_validation.py)
-        build_deps, has_setuptools = get_build_requirements(repo_dir, repo)
-
-        # Add historical setuptools if no constraint found (like full_validation.py)
         commit_date = get_commit_date(repo_dir, base_commit)
-        if not has_setuptools:
-            historical_setuptools = get_historical_setuptools(commit_date, build_deps)
-            build_deps.insert(0, historical_setuptools)
-            print(f"  ✓ Detected commit date: {commit_date}, using {historical_setuptools}")
 
-    # Get repo-specific settings (like full_validation.py)
-    repo_config = RepoConfig(repo)
-    runtime_deps = repo_config.get_runtime_deps(commit_date)
-    env_vars = repo_config.get_env_vars()
+        if language == "python":
+            python_version = detect_python_version(repo_dir, created_at)
+            print(f"  ✓ Detected Python version: {python_version}")
+            build_deps, has_setuptools = get_build_requirements(repo_dir, repo)
+            if not has_setuptools:
+                historical_setuptools = get_historical_setuptools(commit_date, build_deps)
+                build_deps.insert(0, historical_setuptools)
+                print(f"  ✓ Commit date: {commit_date}, using {historical_setuptools}")
+        elif language == "rust":
+            rust_version = detect_rust_version(repo_dir, created_at)
+            print(f"  ✓ Detected Rust version: {rust_version}")
+        elif language == "go":
+            go_version = detect_go_version(repo_dir, created_at)
+            print(f"  ✓ Detected Go version: {go_version}")
+        elif language == "java":
+            java_version = detect_java_version(repo_dir, created_at)
+            print(f"  ✓ Detected Java version: {java_version}")
+        elif language == "php":
+            php_version = detect_php_version(repo_dir, created_at)
+            print(f"  ✓ Detected PHP version: {php_version}")
+        elif language == "javascript":
+            node_version = detect_js_version(repo_dir, created_at)
+            print(f"  ✓ Detected Node.js version: {node_version}")
+        elif language == "ruby":
+            ruby_version = detect_ruby_version(repo_dir, created_at)
+            print(f"  ✓ Detected Ruby version: {ruby_version}")
+        else:  # c
+            print(f"  ✓ C project detected (compiler from base image)")
 
-    print(f"→ Build deps: {build_deps}")
-    print(f"→ Runtime deps: {runtime_deps}")
-    if env_vars:
-        print(f"→ Environment vars: {env_vars}")
-
-    # Get Dockerfile path
+    # Get Dockerfile and build args
     script_dir = Path(__file__).parent.parent
-    dockerfile_path = script_dir / "templates" / "Dockerfile.instance"
+    dockerfile_path = get_language_dockerfile(language, script_dir)
 
-    # Build image
-    print(f"→ Building Docker image...")
+    print(f"→ Building Docker image ({language})...")
     print(f"  This may take 5-10 minutes...")
 
-    build_args = [
-        "--build-arg", f"PYTHON_VERSION={python_version}",
+    common_args = [
         "--build-arg", f"REPO_URL={repo_url}",
         "--build-arg", f"REPO_NAME={repo.split('/')[-1]}",
         "--build-arg", f"BASE_COMMIT={base_commit}",
         "--build-arg", f"CREATED_AT={created_at}",
-        "--build-arg", f"BUILD_DEPS={' '.join(build_deps)}",
-        "--build-arg", f"RUNTIME_DEPS={' '.join(runtime_deps)}",
-        "--build-arg", f"CFLAGS={env_vars.get('CFLAGS', '')}",
     ]
 
+    if language == "python":
+        repo_config = RepoConfig(repo)
+        runtime_deps = repo_config.get_runtime_deps(commit_date)
+        env_vars = repo_config.get_env_vars()
+
+        # For old matplotlib (pre-2021): pin numpy<1.19 in BUILD_DEPS so the C extensions
+        # are compiled against that version.  Mirrors full_validation.py lines 966-985.
+        # The runtime_deps already pins numpy<1.19 (via get_runtime_deps); pinning here
+        # ensures the build-time numpy matches, preventing ABI mismatch at test time.
+        if 'matplotlib' in repo and commit_date < "2021-01-01":
+            build_deps = [
+                'numpy<1.19' if dep.lower().startswith('numpy') or 'oldest-supported-numpy' in dep.lower()
+                else dep
+                for dep in build_deps
+            ]
+            if not any(dep.lower().startswith('numpy') for dep in build_deps):
+                build_deps.append('numpy<1.19')
+
+        print(f"→ Build deps: {build_deps}")
+        print(f"→ Runtime deps: {runtime_deps}")
+        if env_vars:
+            print(f"→ Environment vars: {env_vars}")
+        build_args = common_args + [
+            "--build-arg", f"PYTHON_VERSION={python_version}",
+            "--build-arg", f"BUILD_DEPS={' '.join(build_deps)}",
+            "--build-arg", f"RUNTIME_DEPS={' '.join(runtime_deps)}",
+            "--build-arg", f"CFLAGS={env_vars.get('CFLAGS', '')}",
+        ]
+    elif language == "rust":
+        build_args = common_args + ["--build-arg", f"RUST_VERSION={rust_version}"]
+    elif language == "go":
+        build_args = common_args + ["--build-arg", f"GO_VERSION={go_version}"]
+    elif language == "java":
+        build_args = common_args + ["--build-arg", f"JAVA_VERSION={java_version}"]
+    elif language == "php":
+        build_args = common_args + ["--build-arg", f"PHP_VERSION={php_version}"]
+    elif language == "javascript":
+        build_args = common_args + ["--build-arg", f"NODE_VERSION={node_version}"]
+    elif language == "ruby":
+        build_args = common_args + ["--build-arg", f"RUBY_VERSION={ruby_version}"]
+    else:  # c
+        build_args = common_args
+
+    # Use buildx with --load to produce a simple single-platform manifest (not a manifest list).
+    # This ensures docker push creates a plain manifest pullable from any machine.
+    platform = "linux/arm64/v8" if arch == "arm64" else "linux/amd64"
     result = subprocess.run(
         [
-            "docker", "build",
-            "--platform", "linux/amd64",
+            "docker", "buildx", "build",
+            "--platform", platform,
+            "--provenance=false",
+            "--load",
             "-f", str(dockerfile_path),
             "-t", image_tag,
             *build_args,
@@ -611,6 +1121,172 @@ def build_instance_image(
     if result.returncode != 0:
         print(f"✗ Failed to build image: {instance_id}")
         return False, ""
+
+    # PHP post-build: bake all environment requirements into the image so
+    # run_evaluation receives a fully ready image without runtime workarounds.
+    if language == "php":
+        # Step 1: Ensure SQLite extension is present
+        print(f"→ Ensuring PHP SQLite extension is installed...")
+        check_result = subprocess.run(
+            ["docker", "run", "--rm", image_tag, "bash", "-c",
+             "php -m | grep -qi pdo_sqlite && echo HAS || echo MISSING"],
+            capture_output=True, text=True, timeout=30
+        )
+        if "MISSING" in check_result.stdout:
+            ver_result = subprocess.run(
+                ["docker", "run", "--rm", image_tag, "bash", "-c",
+                 "php --version 2>/dev/null | head -1"],
+                capture_output=True, text=True, timeout=15
+            )
+            m_ver = re.search(r'PHP\s+(\d+\.\d+)', ver_result.stdout)
+            php_ver_str = m_ver.group(1) if m_ver else php_version
+            install_cmd = (
+                "apt-get update -qq 2>/dev/null && "
+                f"(apt-get install -y php{php_ver_str}-sqlite3 2>/dev/null || "
+                "apt-get install -y php-sqlite3 2>/dev/null || true)"
+            )
+            ext_container = f"php_ext_{instance_id.replace('/', '_').replace('__', '_')}"
+            subprocess.run(["docker", "rm", "-f", ext_container], capture_output=True)
+            subprocess.run(
+                ["docker", "run", "--name", ext_container, image_tag, "bash", "-c", install_cmd],
+                capture_output=True, text=True, timeout=120
+            )
+            subprocess.run(["docker", "commit", ext_container, image_tag], capture_output=True)
+            subprocess.run(["docker", "rm", "-f", ext_container], capture_output=True)
+            print(f"  ✓ PHP SQLite extension installed")
+        else:
+            print(f"  ✓ PHP SQLite extension already present")
+
+        # Step 2: Ensure PHP version meets PHPUnit's requirement
+        print(f"→ Checking PHPUnit PHP version requirement...")
+        phpunit_ver_result = subprocess.run(
+            ["docker", "run", "--rm", image_tag, "bash", "-c",
+             "cd /testbed && vendor/bin/phpunit --version 2>&1 | head -5 || true"],
+            capture_output=True, text=True, timeout=30
+        )
+        req_match = re.search(r'requires PHP >= (\d+\.\d+)', phpunit_ver_result.stdout + phpunit_ver_result.stderr)
+        if req_match:
+            required_ver = req_match.group(1)
+            cur_result = subprocess.run(
+                ["docker", "run", "--rm", image_tag, "bash", "-c",
+                 "php --version 2>/dev/null | head -1 || true"],
+                capture_output=True, text=True, timeout=15
+            )
+            cur_match = re.search(r'PHP\s+(\d+\.\d+)', cur_result.stdout)
+            if cur_match:
+                current_ver = cur_match.group(1)
+                def _ver_tuple(v):
+                    return tuple(int(x) for x in v.split('.'))
+                if _ver_tuple(current_ver) < _ver_tuple(required_ver):
+                    print(f"  → PHPUnit requires PHP >= {required_ver} (image has PHP {current_ver}), upgrading...")
+                    upgrade_cmd = (
+                        "apt-get update -qq 2>/dev/null && "
+                        f"(apt-get install -y -q "
+                        f"php{required_ver}-cli php{required_ver}-common php{required_ver}-xml "
+                        f"php{required_ver}-zip php{required_ver}-mbstring php{required_ver}-curl "
+                        f"php{required_ver}-gmp php{required_ver}-intl php{required_ver}-tokenizer "
+                        f"2>/dev/null || "
+                        f"apt-get install -y -q php{required_ver}-cli php{required_ver}-common "
+                        f"php{required_ver}-xml php{required_ver}-mbstring 2>/dev/null || true) && "
+                        f"(update-alternatives --set php /usr/bin/php{required_ver} 2>/dev/null || "
+                        f"ln -sf /usr/bin/php{required_ver} /usr/bin/php 2>/dev/null || true)"
+                    )
+                    upgrade_container = f"php_upgrade_{instance_id.replace('/', '_').replace('__', '_')}"
+                    subprocess.run(["docker", "rm", "-f", upgrade_container], capture_output=True)
+                    subprocess.run(
+                        ["docker", "run", "--name", upgrade_container, image_tag, "bash", "-c", upgrade_cmd],
+                        capture_output=True, text=True, timeout=300
+                    )
+                    subprocess.run(["docker", "commit", upgrade_container, image_tag], capture_output=True)
+                    subprocess.run(["docker", "rm", "-f", upgrade_container], capture_output=True)
+                    print(f"  ✓ PHP upgraded to {required_ver}")
+                else:
+                    print(f"  ✓ PHP {current_ver} already meets PHPUnit requirement (>= {required_ver})")
+        else:
+            print(f"  ✓ PHPUnit has no additional PHP version requirement")
+
+    # For Python: pre-install packages that test_patch imports but the model patch adds to
+    # install_requires.  Without this, pytest collection fails with ModuleNotFoundError
+    # (e.g. appdirs) because the base image is built at base_commit before the dependency
+    # was added.  Baking it into the image means every model evaluation gets it for free.
+    if language == "python":
+        test_patch = instance.get('test_patch', '')
+        gt_patch = instance.get('patch', '')
+        if test_patch and gt_patch:
+            _test_imports = _py_extract_imports(test_patch)
+            _gt_deps = _py_extract_install_requires(gt_patch)
+            _needed = _test_imports & _gt_deps
+            if _needed:
+                print(f"→ Pre-installing {len(_needed)} test-patch dependency(ies): {', '.join(sorted(_needed))}")
+                _install_pkgs = ' '.join(sorted(_needed))
+                _install_cmd = f"cd /testbed && /opt/conda/envs/testbed/bin/pip install {_install_pkgs} -q 2>&1"
+                _dep_container = f"predeps_{instance_id.replace('/', '_').replace('__', '_')}"
+                subprocess.run(["docker", "rm", "-f", _dep_container], capture_output=True)
+                _dep_result = subprocess.run(
+                    ["docker", "run", "--name", _dep_container, image_tag, "bash", "-c", _install_cmd],
+                    capture_output=True, text=True, timeout=120
+                )
+                if _dep_result.returncode == 0:
+                    subprocess.run(["docker", "commit", _dep_container, image_tag], capture_output=True)
+                    print(f"  ✓ Pre-installed: {', '.join(sorted(_needed))}")
+                else:
+                    print(f"  ⚠ Pre-install failed: {_dep_result.stdout[-200:]}")
+                subprocess.run(["docker", "rm", "-f", _dep_container], capture_output=True)
+
+    # Python post-build: verify the package is importable.
+    # pip install -e . uses || true in the Dockerfile, so build failures are silent.
+    # Repos with C extensions (scikit-learn, astropy) need cython<0.30 pinned; if a newer
+    # Cython was present (e.g. from a previous pip call), the compilation silently fails.
+    # Mirrors full_validation.py step 6: verify import, retry with pinned build deps if needed.
+    if language == "python":
+        repo_config = RepoConfig(repo)
+        pkg_name = repo_config.get_package_name()
+        print(f"→ Verifying Python package '{pkg_name}' is importable...")
+        check_result = subprocess.run(
+            ["docker", "run", "--rm", image_tag, "bash", "-c",
+             f"python -c 'import {pkg_name}' 2>/dev/null && echo OK || echo FAILED"],
+            capture_output=True, text=True, timeout=30
+        )
+        if "FAILED" in check_result.stdout:
+            print(f"  ⚠ Package '{pkg_name}' not importable — rebuilding with pinned build deps...")
+            needs_no_isolation = any(r in repo for r in ['scikit-learn', 'astropy', 'matplotlib'])
+            cflags = '-Wno-error=incompatible-pointer-types' if any(r in repo for r in ['scikit-learn', 'astropy']) else ''
+            rebuild_parts = ["cd /testbed"]
+            if cflags:
+                rebuild_parts.append(f"export CFLAGS='{cflags}'")
+            # Install pinned build deps (cython<0.30 required for old scikit-learn/astropy Cython code)
+            # Each dep must be single-quoted so the shell does not interpret < as redirection
+            pinned_build_deps = ' '.join(f"'{dep}'" for dep in repo_config.get_build_deps())
+            rebuild_parts.append(
+                f"/opt/conda/envs/testbed/bin/pip install {pinned_build_deps} -q 2>&1 || true"
+            )
+            pip_flags = "--no-build-isolation" if needs_no_isolation else ""
+            rebuild_parts.append(
+                f"/opt/conda/envs/testbed/bin/pip install -e . {pip_flags} -q 2>&1 || "
+                f"/opt/conda/envs/testbed/bin/pip install . {pip_flags} -q 2>&1 || "
+                f"/opt/conda/envs/testbed/bin/python setup.py develop -q 2>&1 || true"
+            )
+            rebuild_cmd = " && ".join(rebuild_parts)
+            rebuild_container = f"rebuild_pkg_{instance_id.replace('/', '_').replace('__', '_')}"
+            subprocess.run(["docker", "rm", "-f", rebuild_container], capture_output=True)
+            rebuild_result = subprocess.run(
+                ["docker", "run", "--name", rebuild_container, image_tag, "bash", "-c", rebuild_cmd],
+                capture_output=True, text=True, timeout=600
+            )
+            subprocess.run(["docker", "commit", rebuild_container, image_tag], capture_output=True)
+            subprocess.run(["docker", "rm", "-f", rebuild_container], capture_output=True)
+            # Final verification
+            recheck = subprocess.run(
+                ["docker", "run", "--rm", image_tag, "bash", "-c",
+                 f"python -c 'import {pkg_name}' 2>/dev/null && echo OK || echo FAILED"],
+                capture_output=True, text=True, timeout=30
+            )
+            if "OK" in recheck.stdout:
+                print(f"  ✓ Package '{pkg_name}' rebuilt and importable")
+            else:
+                print(f"  ✗ Package '{pkg_name}' still not importable after rebuild — image may produce 0 test results")
+        else:
+            print(f"  ✓ Package '{pkg_name}' importable")
 
     print()
     print("=" * 60)
@@ -635,6 +1311,12 @@ def main():
         action="store_true",
         help="Force rebuild even if images exist"
     )
+    parser.add_argument(
+        "--arch",
+        default="x86_64",
+        choices=["x86_64", "arm64"],
+        help="Target architecture (default: x86_64)"
+    )
 
     args = parser.parse_args()
 
@@ -658,7 +1340,8 @@ def main():
     for instance in instances:
         success, image_tag = build_instance_image(
             instance,
-            force_rebuild=args.force_rebuild
+            force_rebuild=args.force_rebuild,
+            arch=args.arch,
         )
         if success:
             success_count += 1
