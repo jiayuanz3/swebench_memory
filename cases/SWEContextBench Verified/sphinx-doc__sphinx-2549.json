@@ -1,0 +1,52 @@
+{
+  "repo": "sphinx-doc/sphinx",
+  "pull_number": 8638,
+  "instance_id": "sphinx-doc__sphinx-2549",
+  "issue_numbers": [
+    "2549"
+  ],
+  "base_commit": "4b452338f914d4f6b54704222d70ae8a746e3db5",
+  "patch": "diff --git a/CHANGES b/CHANGES\nindex 9c889420fd6..d8a0675836e 100644\n--- a/CHANGES\n+++ b/CHANGES\n@@ -22,6 +22,8 @@ Incompatible changes\n   ``<div>``\n * #8508: LaTeX: uplatex becomes a default setting of latex_engine for Japanese\n   documents\n+* #5977: py domain: ``:var:``, ``:cvar:`` and ``:ivar:`` fields do not create\n+  cross-references\n \n Deprecated\n ----------\ndiff --git a/sphinx/domains/python.py b/sphinx/domains/python.py\nindex 000e2e8d34f..5afe2993a4f 100644\n--- a/sphinx/domains/python.py\n+++ b/sphinx/domains/python.py\n@@ -354,7 +354,7 @@ class PyObject(ObjectDescription):\n                             'keyword', 'kwarg', 'kwparam'),\n                      typerolename='class', typenames=('paramtype', 'type'),\n                      can_collapse=True),\n-        PyTypedField('variable', label=_('Variables'), rolename='obj',\n+        PyTypedField('variable', label=_('Variables'),\n                      names=('var', 'ivar', 'cvar'),\n                      typerolename='class', typenames=('vartype',),\n                      can_collapse=True),\n",
+  "test_patch": "diff --git a/tests/test_domain_py.py b/tests/test_domain_py.py\nindex e0c690518f6..537bae15bb6 100644\n--- a/tests/test_domain_py.py\n+++ b/tests/test_domain_py.py\n@@ -838,6 +838,30 @@ def test_info_field_list(app):\n                 **{\"py:module\": \"example\", \"py:class\": \"Class\"})\n \n \n+def test_info_field_list_var(app):\n+    text = (\".. py:class:: Class\\n\"\n+            \"\\n\"\n+            \"   :var int attr: blah blah\\n\")\n+    doctree = restructuredtext.parse(app, text)\n+\n+    assert_node(doctree, (addnodes.index,\n+                          [desc, (desc_signature,\n+                                  [desc_content, nodes.field_list, nodes.field])]))\n+    assert_node(doctree[1][1][0][0], ([nodes.field_name, \"Variables\"],\n+                                      [nodes.field_body, nodes.paragraph]))\n+\n+    # :var int attr:\n+    assert_node(doctree[1][1][0][0][1][0],\n+                ([addnodes.literal_strong, \"attr\"],\n+                 \" (\",\n+                 [pending_xref, addnodes.literal_emphasis, \"int\"],\n+                 \")\",\n+                 \" -- \",\n+                 \"blah blah\"))\n+    assert_node(doctree[1][1][0][0][1][0][2], pending_xref,\n+                refdomain=\"py\", reftype=\"class\", reftarget=\"int\", **{\"py:class\": \"Class\"})\n+\n+\n @pytest.mark.sphinx(freshenv=True)\n def test_module_index(app):\n     text = (\".. py:module:: docutils\\n\"\n",
+  "problem_statement": "PythonDomain.resolve_xref incorrectly matches ivars to class methods\nThis issue was originally described in a [stackoverflow post](http://stackoverflow.com/questions/31784830/sphinx-ivar-tag-goes-looking-for-cross-references) and has gone unanswered for a while. If an `:ivar:` has the same name as a method in a different class, a cross reference is incorrectly created. Furthermore, if two classes have methods of the same name as the `:ivar:`, a warning is raised saying:\n`WARNING: more than one target found for cross-reference ...`\n\n",
+  "hints_text": "I'm having the exact same problem, is there a known workaround for that? I'm trying to build pytest's documentation with `-W`, and this is the only warning that I couldn't get rid of...\n\nI still haven't found a workaround.\n\nI had to change from `ivar`s in the dosctring to inline comments as can be seen [here](https://github.com/pytest-dev/pytest/pull/1848#discussion_r75794956), in case others find this useful. \n\nBump, also having this issue.\n\nI'm getting this same error with `:param:`\n\nme too -- seeing the issue also with `:param list foo:`\nStill no good workaround for this \ud83d\ude15 \nAlso seeing this with `:type foo: list`\nIt is perhaps not a \"good\" workaround, but this monkey patch works: https://stackoverflow.com/a/41184353.\nI'm seeing this with `:attr:`, where using\r\n```\r\n:attr:`~.current`\r\n```\r\nwithin docstrings finds `current` attributes/properties of other unrelated classes, too, and warns about them. Sometimes even the wrong one is preferred and thus linked in the output.\n> :ivar: has the same name as a method in a different class\r\n\r\n`__slots__` seems to play into this as well:\r\n\r\nfoo.py:\r\n```\r\nclass Foo:\r\n    \"\"\"\r\n    :ivar id: thing\r\n    \"\"\"\r\n\r\n    __slots__ = ['id']\r\n```\r\n\r\nbar.py:\r\n```\r\nclass Bar:\r\n    \"\"\"\r\n    :ivar id: thing\r\n    \"\"\"\r\n\r\n    __slots__ = ['id']\r\n```\r\n\r\nlog:\r\n```\r\nbar.py:docstring of bar.Bar:: WARNING: more than one target found for cross-reference 'id': bar.Bar.id, foo.Foo.id\r\n```\r\n\r\nWithout `__slots__` this doesn't happen. With `__slots__`, an `id` field appears at the bottom of the class documentation that wasn't there before, and if the classes are in different files, the `ivar` representation links to this field. However, if the classes are in the same file, then the second class's `ivar` representation will link to the first class's `id` field.\nThis randomly fixed the issue on my project. Not sure why.\r\n\r\n```\r\n:ivar ~.signature: The signature of this signature tree\r\n:vartype ~.signature: str\r\n```\n> This randomly fixed the issue on my project. Not sure why.\r\n> \r\n> ```\r\n> :ivar ~.signature: The signature of this signature tree\r\n> :vartype ~.signature: str\r\n> ```\r\n\r\nWith Sphinx 3.3, this fixed most of the duplicate crossref warnings for me, but even this wasn't enough in some cases. I had to also add the class name prefix:\r\n\r\n```py\r\n\r\n# pkg.nn.tf_impl.py\r\n\r\nclass MyRNN(tf.keras.AbstractRNNCell):\r\n    \"\"\"\r\n    :ivar tf.keras.layers.Dense ~MyRNN.layer1: :math:`l_1` layer.\r\n    :ivar tf.keras.layers.Dense ~MyRNN.layer2: :math:`l_2` layer.\r\n    \"\"\"\r\n\r\n# pkg.nn.torch_impl.py\r\n\r\nclass MyRNN(nn.Module):\r\n    \"\"\"\r\n    :ivar torch.nn.Linear ~MyRNN.layer1: :math:`l_1` layer.\r\n    :ivar torch.nn.Linear ~MyRNN.layer2: :math:`l_2` layer.\r\n    :ivar torch.nn.Linear layer3: :math:`l_3` layer.\r\n    \"\"\"\r\n```\r\nI suppose this is because the classes have the same name, but are located in different modules.",
+  "created_at": "2021-01-01T13:54:38Z",
+  "FAIL_TO_PASS": [
+    "tests/test_domain_py.py::test_info_field_list_var"
+  ],
+  "PASS_TO_PASS": [
+    "tests/test_domain_py.py::test_canonical",
+    "tests/test_domain_py.py::test_domain_py_find_obj",
+    "tests/test_domain_py.py::test_domain_py_objects",
+    "tests/test_domain_py.py::test_domain_py_xrefs",
+    "tests/test_domain_py.py::test_exceptions_module_is_ignored",
+    "tests/test_domain_py.py::test_function_signatures",
+    "tests/test_domain_py.py::test_get_full_qualified_name",
+    "tests/test_domain_py.py::test_info_field_list",
+    "tests/test_domain_py.py::test_modindex_common_prefix",
+    "tests/test_domain_py.py::test_module_index",
+    "tests/test_domain_py.py::test_module_index_not_collapsed",
+    "tests/test_domain_py.py::test_module_index_submodule",
+    "tests/test_domain_py.py::test_noindexentry",
+    "tests/test_domain_py.py::test_optional_pyfunction_signature",
+    "tests/test_domain_py.py::test_parse_annotation",
+    "tests/test_domain_py.py::test_pyattribute",
+    "tests/test_domain_py.py::test_pyclass_options",
+    "tests/test_domain_py.py::test_pyclassmethod",
+    "tests/test_domain_py.py::test_pydata",
+    "tests/test_domain_py.py::test_pydata_signature",
+    "tests/test_domain_py.py::test_pydata_signature_old",
+    "tests/test_domain_py.py::test_pydecorator_signature",
+    "tests/test_domain_py.py::test_pydecoratormethod_signature",
+    "tests/test_domain_py.py::test_pyexception_signature",
+    "tests/test_domain_py.py::test_pyfunction",
+    "tests/test_domain_py.py::test_pyfunction_signature",
+    "tests/test_domain_py.py::test_pyfunction_signature_full",
+    "tests/test_domain_py.py::test_pymethod_options",
+    "tests/test_domain_py.py::test_pyobject_prefix",
+    "tests/test_domain_py.py::test_pystaticmethod",
+    "tests/test_domain_py.py::test_resolve_xref_for_properties",
+    "tests/test_domain_py.py::test_warn_missing_reference"
+  ],
+  "environment_setup_commit": "4b452338f914d4f6b54704222d70ae8a746e3db5"
+}

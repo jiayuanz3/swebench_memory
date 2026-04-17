@@ -1,0 +1,91 @@
+# SWE-bench Simple: Rust Instance Image
+# Mirrors full_validation_multilingual_rust.py setup logic.
+# Installs rustup + the specified toolchain, then pre-fetches/builds dependencies.
+
+FROM sweb.simple.base:latest
+
+ARG RUST_VERSION=1.70
+
+# Install rustup with the requested toolchain (minimal profile)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal
+
+ENV PATH="/root/.cargo/bin:$PATH"
+# Override any rust-toolchain file in the repo (mirrors env_vars['RUSTUP_TOOLCHAIN'])
+ENV RUSTUP_TOOLCHAIN=${RUST_VERSION}
+
+# Clone repository
+ARG REPO_URL
+ARG REPO_NAME
+RUN git clone ${REPO_URL} /testbed
+WORKDIR /testbed
+
+# Checkout base commit
+ARG BASE_COMMIT
+RUN git checkout ${BASE_COMMIT}
+
+ARG CREATED_AT=""
+
+# Install common system libraries needed by Rust crates (openssl-sys, etc.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-fetch and build dependencies with smart error recovery.
+#
+# Strategy:
+# 1. Try cargo fetch. If a workspace member has incompatible deps (e.g. tokio-tls with
+#    security-framework ^0.2 no longer available on crates.io), remove it from the
+#    workspace members list and retry (up to 3 broken members).
+# 2. If the newer crates.io index requires a newer Rust edition (2024) or uses
+#    namespaced dep: features (needs Rust >= 1.60), upgrade to Rust 1.75 which
+#    covers edition 2021/2024 crates while still being broadly compatible.
+#    Pin any transitive deps that need edition 2024 crates to older compatible versions.
+# 3. Build tests with --cap-lints=warn to suppress lints-as-errors from newer Rust
+#    on old code (e.g. drop(ManuallyDrop<T>) no-op lint).
+RUN bash -c ' \
+    source $HOME/.cargo/env 2>/dev/null || true; \
+    unset RUSTUP_TOOLCHAIN; \
+    cd /testbed; \
+    \
+    # Step 1: Try cargo fetch, removing broken workspace members on failure \
+    for attempt in 1 2 3 4; do \
+        output=$(cargo fetch 2>&1); \
+        rc=$?; \
+        if [ $rc -eq 0 ]; then break; fi; \
+        member=$(echo "$output" | grep -oP "required by package \`[^\`]+ v[^\(]+\(/testbed/\K[^/)]+"); \
+        if [ -z "$member" ]; then \
+            echo "cargo fetch failed (no broken member detected): $output" | head -5; \
+            break; \
+        fi; \
+        echo "Removing broken workspace member: $member"; \
+        sed -i "/$member/d" Cargo.toml; \
+    done; \
+    \
+    # Step 2: Detect if a newer Rust toolchain is needed \
+    fetch_output=$(cargo fetch 2>&1 || true); \
+    needs_upgrade=0; \
+    if echo "$fetch_output" | grep -qE "older than the .20[0-9]+. edition|namespaced features with the .dep:. prefix"; then \
+        needs_upgrade=1; \
+    fi; \
+    if [ "$needs_upgrade" = "1" ]; then \
+        echo "Installing Rust 1.75 for modern crates compatibility..."; \
+        rustup toolchain install 1.75 --no-self-update --profile minimal 2>&1 | tail -1; \
+        rustup default 1.75; \
+        # Pin cc to avoid namespaced dep: features issue \
+        cargo update cc --precise 1.0.83 2>/dev/null || true; \
+        # Pin tempfile to avoid getrandom/fastrand edition 2024 transitive dep chain \
+        cargo update tempfile --precise 3.9.0 2>/dev/null || true; \
+    fi; \
+    \
+    # Step 3: Build library, then tests \
+    RUSTFLAGS="--cap-lints=warn" cargo build 2>/dev/null || true; \
+    CARGO_BUILD_JOBS=2 RUSTFLAGS="--cap-lints=warn" cargo build --tests 2>/dev/null || true; \
+    # Retry with --all-features: some test files need feature-gated macros (e.g. #[tokio::test])
+    CARGO_BUILD_JOBS=2 RUSTFLAGS="--cap-lints=warn" cargo build --tests --all-features 2>/dev/null || true; \
+    true \
+'
+# Pre-install cargo-insta for snapshot-testing projects (e.g. ruff, ripgrep).
+RUN cargo install cargo-insta --quiet 2>/dev/null || true
+
+CMD ["/bin/bash"]

@@ -1,0 +1,31 @@
+{
+  "repo": "django/django",
+  "pull_number": 11966,
+  "instance_id": "django__django-30903",
+  "issue_numbers": [
+    "30903"
+  ],
+  "base_commit": "2a54ce72f95977fefe796e99c7bbf6cd366927f9",
+  "patch": "diff --git a/AUTHORS b/AUTHORS\nindex 06998e7c3c47..8e126b25379f 100644\n--- a/AUTHORS\n+++ b/AUTHORS\n@@ -340,6 +340,7 @@ answer newbie questions, and generally made Django that much better:\n     Gustavo Picon\n     hambaloney\n     Hang Park <hangpark@kaist.ac.kr>\n+    Hannes Ljungberg <hannes.ljungberg@gmail.com>\n     Hannes Stru\u00df <x@hannesstruss.de>\n     Hasan Ramezani <hasan.r67@gmail.com>\n     Hawkeye\ndiff --git a/django/db/backends/ddl_references.py b/django/db/backends/ddl_references.py\nindex d71f6169eaa0..44e49806f815 100644\n--- a/django/db/backends/ddl_references.py\n+++ b/django/db/backends/ddl_references.py\n@@ -110,13 +110,14 @@ def __init__(self, table, columns, quote_name, col_suffixes=(), opclasses=()):\n \n     def __str__(self):\n         def col_str(column, idx):\n-            try:\n-                col = self.quote_name(column) + self.col_suffixes[idx]\n-            except IndexError:\n-                col = self.quote_name(column)\n             # Index.__init__() guarantees that self.opclasses is the same\n             # length as self.columns.\n-            return '{} {}'.format(col, self.opclasses[idx])\n+            col = '{} {}'.format(self.quote_name(column), self.opclasses[idx])\n+            try:\n+                col = '{} {}'.format(col, self.col_suffixes[idx])\n+            except IndexError:\n+                pass\n+            return col\n \n         return ', '.join(col_str(column, idx) for idx, column in enumerate(self.columns))\n \ndiff --git a/docs/releases/2.2.7.txt b/docs/releases/2.2.7.txt\nindex 3232b5c5e843..cf1f52a685e7 100644\n--- a/docs/releases/2.2.7.txt\n+++ b/docs/releases/2.2.7.txt\n@@ -17,3 +17,7 @@ Bugfixes\n * Prevented :option:`migrate --plan` from showing that ``RunPython`` operations\n   are irreversible when ``reverse_code`` callables don't have docstrings or\n   when showing a forward migration plan (:ticket:`30870`).\n+\n+* Fixed migrations crash on PostgreSQL when adding an\n+  :class:`~django.db.models.Index` with fields ordering and\n+  :attr:`~.Index.opclasses` (:ticket:`30903`).\n",
+  "test_patch": "diff --git a/tests/indexes/tests.py b/tests/indexes/tests.py\nindex 2272cadc4f57..588feaddff42 100644\n--- a/tests/indexes/tests.py\n+++ b/tests/indexes/tests.py\n@@ -196,6 +196,33 @@ def test_ops_class_partial_tablespace(self):\n             cursor.execute(self.get_opclass_query % indexname)\n             self.assertCountEqual(cursor.fetchall(), [('text_pattern_ops', indexname)])\n \n+    def test_ops_class_descending(self):\n+        indexname = 'test_ops_class_ordered'\n+        index = Index(\n+            name=indexname,\n+            fields=['-body'],\n+            opclasses=['text_pattern_ops'],\n+        )\n+        with connection.schema_editor() as editor:\n+            editor.add_index(IndexedArticle2, index)\n+        with editor.connection.cursor() as cursor:\n+            cursor.execute(self.get_opclass_query % indexname)\n+            self.assertCountEqual(cursor.fetchall(), [('text_pattern_ops', indexname)])\n+\n+    def test_ops_class_descending_partial(self):\n+        indexname = 'test_ops_class_ordered_partial'\n+        index = Index(\n+            name=indexname,\n+            fields=['-body'],\n+            opclasses=['text_pattern_ops'],\n+            condition=Q(headline__contains='China'),\n+        )\n+        with connection.schema_editor() as editor:\n+            editor.add_index(IndexedArticle2, index)\n+        with editor.connection.cursor() as cursor:\n+            cursor.execute(self.get_opclass_query % indexname)\n+            self.assertCountEqual(cursor.fetchall(), [('text_pattern_ops', indexname)])\n+\n \n @skipUnless(connection.vendor == 'mysql', 'MySQL tests')\n class SchemaIndexesMySQLTests(TransactionTestCase):\n",
+  "problem_statement": "Creating an index with specified ordering and opclass results in syntax error.\n\nDescription\n      \n\nCreating an index on postgres with both order and opclass specified crashes with a syntax error.\n\n```\nindex\n \n=\n \nIndex\n(\n\n    \nname\n=\nindexname\n,\n\n    \nfields\n=\n[\n'-body'\n],\n\n    \nopclasses\n=\n[\n'text_pattern_ops'\n],\n\n)\n```\n\n```\ndjango.db.utils.ProgrammingError: syntax error at or near \"text_pattern_ops\"\nLINE 1: ...rdered\" ON \"indexes_indexedarticle2\" (\"body\" DESC text_patte...\n```\n\nThis is because \n`opclass`\n is supposed to be inserted before \n`ASC | DESC`\n in \n`CREATE INDEX`\n. \n\nSee \n\u200b\nhttps://www.postgresql.org/docs/current/sql-createindex.html",
+  "hints_text": "See Django ticket: https://code.djangoproject.com/ticket/30903",
+  "created_at": "2019-10-23T20:19:14Z",
+  "FAIL_TO_PASS": [
+    "tests/indexes/tests.py::SchemaIndexesPostgreSQLTests::test_ops_class_descending",
+    "tests/indexes/tests.py::SchemaIndexesPostgreSQLTests::test_ops_class_descending_partial"
+  ],
+  "PASS_TO_PASS": [
+    "tests/indexes/tests.py::PartialIndexTests::test_boolean_restriction_partial",
+    "tests/indexes/tests.py::PartialIndexTests::test_integer_restriction_partial",
+    "tests/indexes/tests.py::PartialIndexTests::test_is_null_condition",
+    "tests/indexes/tests.py::PartialIndexTests::test_multiple_conditions",
+    "tests/indexes/tests.py::PartialIndexTests::test_partial_index",
+    "tests/indexes/tests.py::SchemaIndexesNotPostgreSQLTests::test_create_index_ignores_opclasses",
+    "tests/indexes/tests.py::SchemaIndexesTests::test_index_name",
+    "tests/indexes/tests.py::SchemaIndexesTests::test_index_name_hash",
+    "tests/indexes/tests.py::SchemaIndexesTests::test_index_together",
+    "tests/indexes/tests.py::SchemaIndexesTests::test_index_together_single_list"
+  ],
+  "environment_setup_commit": "2a54ce72f95977fefe796e99c7bbf6cd366927f9"
+}

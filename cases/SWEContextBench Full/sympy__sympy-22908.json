@@ -1,0 +1,38 @@
+{
+  "repo": "sympy/sympy",
+  "pull_number": 22914,
+  "instance_id": "sympy__sympy-22908",
+  "issue_numbers": [
+    "22908"
+  ],
+  "base_commit": "c4e836cdf73fc6aa7bab6a86719a0f08861ffb1d",
+  "patch": "diff --git a/.mailmap b/.mailmap\nindex ef894343dd12..9dcf04e485e7 100644\n--- a/.mailmap\n+++ b/.mailmap\n@@ -97,7 +97,7 @@ Aditya Kumar Sinha <adityakumar113141@gmail.com> aditya113141 <adityakumar113141\n Aditya Ravuri <infprobscix@gmail.com> InfProbSciX <infprobscix@gmail.com>\n Aditya Rohan <riyuzakiiitk@gmail.com>\n Aditya Shah <adityashah30@gmail.com>\n-Advait <apote2050@gmail.com>\n+Advait <apote2050@gmail.com> Advait Pote <92469698+AdvaitPote@users.noreply.github.com>\n Adwait Baokar <adwaitbaokar18@gmail.com> abaokar-07 <adwaitbaokar18@gmail.com>\n Akash Agrawall <akash.wanted@gmail.com>\n Akash Kundu <sk.sayakkundu1997@gmail.com>\ndiff --git a/sympy/printing/pycode.py b/sympy/printing/pycode.py\nindex 3a72ab606c89..fd5a73913316 100644\n--- a/sympy/printing/pycode.py\n+++ b/sympy/printing/pycode.py\n@@ -18,6 +18,8 @@\n \n _known_functions = {\n     'Abs': 'abs',\n+    'Min': 'min',\n+    'Max': 'max',\n }\n _known_functions_math = {\n     'acos': 'acos',\n",
+  "test_patch": "diff --git a/sympy/printing/tests/test_pycode.py b/sympy/printing/tests/test_pycode.py\nindex 9c1285d7ddb3..3d236c729c76 100644\n--- a/sympy/printing/tests/test_pycode.py\n+++ b/sympy/printing/tests/test_pycode.py\n@@ -6,7 +6,7 @@\n from sympy.core import Expr, Mod, symbols, Eq, Le, Gt, zoo, oo, Rational, Pow\n from sympy.core.numbers import pi\n from sympy.core.singleton import S\n-from sympy.functions import acos, KroneckerDelta, Piecewise, sign, sqrt\n+from sympy.functions import acos, KroneckerDelta, Piecewise, sign, sqrt, Min, Max\n from sympy.logic import And, Or\n from sympy.matrices import SparseMatrix, MatrixSymbol, Identity\n from sympy.printing.pycode import (\n@@ -58,6 +58,9 @@ def test_PythonCodePrinter():\n     assert prntr.doprint((2,3)) == \"(2, 3)\"\n     assert prntr.doprint([2,3]) == \"[2, 3]\"\n \n+    assert prntr.doprint(Min(x, y)) == \"min(x, y)\"\n+    assert prntr.doprint(Max(x, y)) == \"max(x, y)\"\n+\n \n def test_PythonCodePrinter_standard():\n     prntr = PythonCodePrinter()\n",
+  "problem_statement": "PythonCodePrinter doesn't support Min and Max\nWe can't generate python code for the sympy function Min and Max.\r\n\r\nFor example:\r\n```\r\nfrom sympy import symbols, Min, pycode\r\na, b = symbols(\"a b\")\r\nc = Min(a,b)\r\nprint(pycode(c))\r\n```\r\nthe output is:\r\n\r\n```\r\n  # Not supported in Python:\r\n  # Min\r\nMin(a, b)\r\n```\r\n\r\nSimilar to issue #16669, we should add following methods to PythonCodePrinter:\r\n\r\n```\r\ndef _print_Min(self, expr):\r\n    return \"min({})\".format(\", \".join(self._print(arg) for arg in expr.args))\r\n\r\n\r\ndef _print_Max(self, expr):\r\n    return \"max({})\".format(\", \".join(self._print(arg) for arg in expr.args))\r\n\r\n``` \n",
+  "hints_text": "This can also be done by simply adding `min` and `max` to `_known_functions`:\r\n```python\r\n_known_functions = {\r\n    'Abs': 'abs',\r\n    'Min': 'min',\r\n}\r\n```\r\n\r\nleading to \r\n\r\n```python\r\n>>> from sympy import Min\r\n>>> from sympy.abc import x, y\r\n>>> from sympy.printing.pycode import PythonCodePrinter\r\n>>> PythonCodePrinter().doprint(Min(x,y))\r\n'min(x, y)'\r\n```\n@ThePauliPrinciple Shall I open a Pull request then with these changes that you mentioned here?\r\n\n> @ThePauliPrinciple Shall I open a Pull request then with these changes that you mentioned here?\r\n\r\nI'm not sure whether the OP (@yonizim ) intended to create a PR or only wanted to mention the issue, but if not, feel free to do so. \nGo ahead @AdvaitPote . Thanks for the fast response.\nSure @yonizim @ThePauliPrinciple !",
+  "created_at": "2022-01-25T10:37:44Z",
+  "FAIL_TO_PASS": [
+    "sympy/printing/tests/test_pycode.py::test_PythonCodePrinter"
+  ],
+  "PASS_TO_PASS": [
+    "sympy/printing/tests/test_pycode.py::test_Integral",
+    "sympy/printing/tests/test_pycode.py::test_MpmathPrinter",
+    "sympy/printing/tests/test_pycode.py::test_NumPyPrinter",
+    "sympy/printing/tests/test_pycode.py::test_NumPyPrinter_print_seq",
+    "sympy/printing/tests/test_pycode.py::test_PythonCodePrinter_standard",
+    "sympy/printing/tests/test_pycode.py::test_SciPyPrinter",
+    "sympy/printing/tests/test_pycode.py::test_airy",
+    "sympy/printing/tests/test_pycode.py::test_airy_prime",
+    "sympy/printing/tests/test_pycode.py::test_beta",
+    "sympy/printing/tests/test_pycode.py::test_codegen_ast_nodes",
+    "sympy/printing/tests/test_pycode.py::test_frac",
+    "sympy/printing/tests/test_pycode.py::test_fresnel_integrals",
+    "sympy/printing/tests/test_pycode.py::test_issue_14283",
+    "sympy/printing/tests/test_pycode.py::test_issue_16535_16536",
+    "sympy/printing/tests/test_pycode.py::test_numerical_accuracy_functions",
+    "sympy/printing/tests/test_pycode.py::test_printmethod",
+    "sympy/printing/tests/test_pycode.py::test_pycode_reserved_words",
+    "sympy/printing/tests/test_pycode.py::test_sqrt"
+  ],
+  "environment_setup_commit": "c4e836cdf73fc6aa7bab6a86719a0f08861ffb1d"
+}

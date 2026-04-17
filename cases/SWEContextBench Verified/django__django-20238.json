@@ -1,0 +1,31 @@
+{
+  "repo": "django/django",
+  "pull_number": 7832,
+  "instance_id": "django__django-20238",
+  "issue_numbers": [
+    "20238"
+  ],
+  "base_commit": "c4e2fc5d9872c9a0c9c052a2e124f8a9b87de9b4",
+  "patch": "diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py\nindex 68ef2a74b7a8..5c281b9c24c1 100644\n--- a/django/core/servers/basehttp.py\n+++ b/django/core/servers/basehttp.py\n@@ -77,6 +77,11 @@ def handle_error(self, request, client_address):\n             super().handle_error(request, client_address)\n \n \n+class ThreadedWSGIServer(socketserver.ThreadingMixIn, WSGIServer):\n+    \"\"\"A threaded version of the WSGIServer\"\"\"\n+    pass\n+\n+\n class ServerHandler(simple_server.ServerHandler):\n     def handle_error(self):\n         # Ignore broken pipe errors, otherwise pass on\ndiff --git a/docs/releases/2.0.txt b/docs/releases/2.0.txt\nindex 6b775bec80f6..818a8ada87ff 100644\n--- a/docs/releases/2.0.txt\n+++ b/docs/releases/2.0.txt\n@@ -193,7 +193,7 @@ Templates\n Tests\n ~~~~~\n \n-* ...\n+* Added threading support to :class:`~django.test.LiveServerTestCase`.\n \n URLs\n ~~~~\n",
+  "test_patch": "diff --git a/django/test/testcases.py b/django/test/testcases.py\nindex 0f879d422215..7955488f48bd 100644\n--- a/django/test/testcases.py\n+++ b/django/test/testcases.py\n@@ -21,7 +21,7 @@\n from django.core.management import call_command\n from django.core.management.color import no_style\n from django.core.management.sql import emit_post_migrate_signal\n-from django.core.servers.basehttp import WSGIRequestHandler, WSGIServer\n+from django.core.servers.basehttp import ThreadedWSGIServer, WSGIRequestHandler\n from django.db import DEFAULT_DB_ALIAS, connection, connections, transaction\n from django.forms.fields import CharField\n from django.http import QueryDict\n@@ -1248,7 +1248,7 @@ def run(self):\n             connections.close_all()\n \n     def _create_server(self, port):\n-        return WSGIServer((self.host, port), QuietWSGIRequestHandler, allow_reuse_address=False)\n+        return ThreadedWSGIServer((self.host, port), QuietWSGIRequestHandler, allow_reuse_address=False)\n \n     def terminate(self):\n         if hasattr(self, 'httpd'):\ndiff --git a/tests/servers/tests.py b/tests/servers/tests.py\nindex 5052f579087f..b114b968dfa7 100644\n--- a/tests/servers/tests.py\n+++ b/tests/servers/tests.py\n@@ -130,3 +130,19 @@ def test_port_bind(self):\n         finally:\n             if hasattr(TestCase, 'server_thread'):\n                 TestCase.server_thread.terminate()\n+\n+\n+class LiverServerThreadedTests(LiveServerBase):\n+    \"\"\"If LiverServerTestCase isn't threaded, these tests will hang.\"\"\"\n+\n+    def test_view_calls_subview(self):\n+        url = '/subview_calling_view/?%s' % urlencode({'url': self.live_server_url})\n+        with self.urlopen(url) as f:\n+            self.assertEqual(f.read(), b'subview calling view: subview')\n+\n+    def test_check_model_instance_from_subview(self):\n+        url = '/check_model_instance_from_subview/?%s' % urlencode({\n+            'url': self.live_server_url,\n+        })\n+        with self.urlopen(url) as f:\n+            self.assertIn(b'emily', f.read())\ndiff --git a/tests/servers/urls.py b/tests/servers/urls.py\nindex 868ecc34f904..4963bde35757 100644\n--- a/tests/servers/urls.py\n+++ b/tests/servers/urls.py\n@@ -7,4 +7,7 @@\n     url(r'^model_view/$', views.model_view),\n     url(r'^create_model_instance/$', views.create_model_instance),\n     url(r'^environ_view/$', views.environ_view),\n+    url(r'^subview_calling_view/$', views.subview_calling_view),\n+    url(r'^subview/$', views.subview),\n+    url(r'^check_model_instance_from_subview/$', views.check_model_instance_from_subview),\n ]\ndiff --git a/tests/servers/views.py b/tests/servers/views.py\nindex f1fb8714c58a..3fa99380b1c5 100644\n--- a/tests/servers/views.py\n+++ b/tests/servers/views.py\n@@ -1,3 +1,5 @@\n+from urllib.request import urlopen\n+\n from django.http import HttpResponse\n \n from .models import Person\n@@ -20,3 +22,18 @@ def create_model_instance(request):\n \n def environ_view(request):\n     return HttpResponse(\"\\n\".join(\"%s: %r\" % (k, v) for k, v in request.environ.items()))\n+\n+\n+def subview(request):\n+    return HttpResponse('subview')\n+\n+\n+def subview_calling_view(request):\n+    response = urlopen(request.GET['url'] + '/subview/')\n+    return HttpResponse('subview calling view: {}'.format(response.read().decode()))\n+\n+\n+def check_model_instance_from_subview(request):\n+    urlopen(request.GET['url'] + '/create_model_instance/')\n+    response = urlopen(request.GET['url'] + '/model_view/')\n+    return HttpResponse('subview calling view: {}'.format(response.read().decode()))\n",
+  "problem_statement": "Support multiple open connections in LiveServerTestCase\n\nDescription\n      \n\nRun a selenium test with LiveServerTestCase. Django starts StoppableWSGIServer. The StoppableWSGIServer is not multithread support. When the codes to be tested call urllib.urlopen to the same server (ie: StoppableWSGIServer) the selenium test will hang and fail because of time-out.",
+  "hints_text": "See Django ticket: https://code.djangoproject.com/ticket/20238",
+  "created_at": "2017-01-10T18:16:12Z",
+  "FAIL_TO_PASS": [
+    "tests/servers/tests.py::LiverServerThreadedTests::test_check_model_instance_from_subview",
+    "tests/servers/tests.py::LiverServerThreadedTests::test_view_calls_subview"
+  ],
+  "PASS_TO_PASS": [
+    "tests/servers/tests.py::LiveServerAddress::test_live_server_url_is_class_property",
+    "tests/servers/tests.py::LiveServerDatabase::test_database_writes",
+    "tests/servers/tests.py::LiveServerDatabase::test_fixtures_loaded",
+    "tests/servers/tests.py::LiveServerPort::test_port_bind",
+    "tests/servers/tests.py::LiveServerViews::test_404",
+    "tests/servers/tests.py::LiveServerViews::test_environ",
+    "tests/servers/tests.py::LiveServerViews::test_media_files",
+    "tests/servers/tests.py::LiveServerViews::test_no_collectstatic_emulation",
+    "tests/servers/tests.py::LiveServerViews::test_static_files",
+    "tests/servers/tests.py::LiveServerViews::test_view"
+  ],
+  "environment_setup_commit": "c4e2fc5d9872c9a0c9c052a2e124f8a9b87de9b4"
+}

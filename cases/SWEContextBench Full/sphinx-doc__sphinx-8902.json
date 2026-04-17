@@ -1,0 +1,52 @@
+{
+  "repo": "sphinx-doc/sphinx",
+  "pull_number": 8638,
+  "instance_id": "sphinx-doc__sphinx-8902",
+  "issue_numbers": [
+    "8902"
+  ],
+  "base_commit": "4b452338f914d4f6b54704222d70ae8a746e3db5",
+  "patch": "diff --git a/CHANGES b/CHANGES\nindex 9c889420fd6..d8a0675836e 100644\n--- a/CHANGES\n+++ b/CHANGES\n@@ -22,6 +22,8 @@ Incompatible changes\n   ``<div>``\n * #8508: LaTeX: uplatex becomes a default setting of latex_engine for Japanese\n   documents\n+* #5977: py domain: ``:var:``, ``:cvar:`` and ``:ivar:`` fields do not create\n+  cross-references\n \n Deprecated\n ----------\ndiff --git a/sphinx/domains/python.py b/sphinx/domains/python.py\nindex 000e2e8d34f..5afe2993a4f 100644\n--- a/sphinx/domains/python.py\n+++ b/sphinx/domains/python.py\n@@ -354,7 +354,7 @@ class PyObject(ObjectDescription):\n                             'keyword', 'kwarg', 'kwparam'),\n                      typerolename='class', typenames=('paramtype', 'type'),\n                      can_collapse=True),\n-        PyTypedField('variable', label=_('Variables'), rolename='obj',\n+        PyTypedField('variable', label=_('Variables'),\n                      names=('var', 'ivar', 'cvar'),\n                      typerolename='class', typenames=('vartype',),\n                      can_collapse=True),\n",
+  "test_patch": "diff --git a/tests/test_domain_py.py b/tests/test_domain_py.py\nindex e0c690518f6..537bae15bb6 100644\n--- a/tests/test_domain_py.py\n+++ b/tests/test_domain_py.py\n@@ -838,6 +838,30 @@ def test_info_field_list(app):\n                 **{\"py:module\": \"example\", \"py:class\": \"Class\"})\n \n \n+def test_info_field_list_var(app):\n+    text = (\".. py:class:: Class\\n\"\n+            \"\\n\"\n+            \"   :var int attr: blah blah\\n\")\n+    doctree = restructuredtext.parse(app, text)\n+\n+    assert_node(doctree, (addnodes.index,\n+                          [desc, (desc_signature,\n+                                  [desc_content, nodes.field_list, nodes.field])]))\n+    assert_node(doctree[1][1][0][0], ([nodes.field_name, \"Variables\"],\n+                                      [nodes.field_body, nodes.paragraph]))\n+\n+    # :var int attr:\n+    assert_node(doctree[1][1][0][0][1][0],\n+                ([addnodes.literal_strong, \"attr\"],\n+                 \" (\",\n+                 [pending_xref, addnodes.literal_emphasis, \"int\"],\n+                 \")\",\n+                 \" -- \",\n+                 \"blah blah\"))\n+    assert_node(doctree[1][1][0][0][1][0][2], pending_xref,\n+                refdomain=\"py\", reftype=\"class\", reftarget=\"int\", **{\"py:class\": \"Class\"})\n+\n+\n @pytest.mark.sphinx(freshenv=True)\n def test_module_index(app):\n     text = (\".. py:module:: docutils\\n\"\n",
+  "problem_statement": "Class variable name cross referencing \n**Describe the bug**\r\nNames of class variables that are described with `:ivar` are getting cross-referenced. I would rather expect that this would not be crossreferenced, as the names of parameters (`:param:`) in methods are not. \r\n\r\nHere is a screenshot:\r\n![obraz](https://user-images.githubusercontent.com/10303802/108172681-647ecb00-70fd-11eb-8cb9-576b10c1cdbf.png)\r\n\r\nNotice here names of variables `time` and `phase`. Both are links. The former one is linked to python's `time` module, the latter is linked to some not relevant part of our code.\r\n\r\nCode that defines that page is here:\r\nhttps://github.com/obspy/obspy/blob/master/obspy/taup/helper_classes.py\r\n\r\nI tried to use `:samp:` directive but it breaks rendering. https://github.com/obspy/obspy/pull/2662#issuecomment-780372177\r\n\r\n**To Reproduce**\r\nSteps to reproduce the behavior:\r\n```\r\n$ apt-get install apt-get install -yqq build-essential gcc libproj-dev proj-data proj-bin libgeos-dev\r\n$ python -m pip install numpy\r\n$ python -m pip install shapely --no-binary shapely\r\n$ git clone git@github.com:obspy/obspy.git\r\n$ cd obspy\r\n$ git switch sphinx3\r\n$ pip install .\r\n$ cd misc/docs\r\n$ python -m pip install -r requirements.txt\r\n$ make html\r\n$ # open build/html/packages/autogen/obspy.taup.helper_classes.Arrival.html and see the class vars of Arrival\r\n```\r\n\r\n**Expected behavior**\r\nNames of class variables should not be links. Exactly as names of method parameters are not.\r\n\r\n**Your project**\r\nhttps://github.com/obspy/obspy\r\n\r\n**Environment info**\r\n- OS: Linux\r\n- Python version: 3.8.7\r\n- Sphinx version: 3.4.3\r\n- Sphinx extensions:  \r\n```python\r\n    'sphinx.ext.intersphinx',\r\n    'sphinx.ext.doctest',\r\n    'sphinx.ext.autodoc',\r\n    'sphinx.ext.viewcode',\r\n    'sphinx.ext.mathjax',\r\n    'sphinx.ext.autosummary',\r\n    'sphinx.ext.coverage',\r\n    'sphinx.ext.duration',\r\n    'sphinx.ext.todo',\r\n    'm2r2',\r\n    # theme\r\n    'sphinx_rtd_theme',\r\n    # custom extensions\r\n    'plot_directive',\r\n    'credits',\r\n    'citations',\r\n```\r\n- Extra tools: [e.g. Browser, tex or something else]\r\n\r\n**Additional context**\r\nAdd any other context about the problem here.\r\n\r\n- [e.g. URL or Ticket]\r\n\r\n\n",
+  "hints_text": "",
+  "created_at": "2021-01-01T13:54:38Z",
+  "FAIL_TO_PASS": [
+    "tests/test_domain_py.py::test_info_field_list_var"
+  ],
+  "PASS_TO_PASS": [
+    "tests/test_domain_py.py::test_canonical",
+    "tests/test_domain_py.py::test_domain_py_find_obj",
+    "tests/test_domain_py.py::test_domain_py_objects",
+    "tests/test_domain_py.py::test_domain_py_xrefs",
+    "tests/test_domain_py.py::test_exceptions_module_is_ignored",
+    "tests/test_domain_py.py::test_function_signatures",
+    "tests/test_domain_py.py::test_get_full_qualified_name",
+    "tests/test_domain_py.py::test_info_field_list",
+    "tests/test_domain_py.py::test_modindex_common_prefix",
+    "tests/test_domain_py.py::test_module_index",
+    "tests/test_domain_py.py::test_module_index_not_collapsed",
+    "tests/test_domain_py.py::test_module_index_submodule",
+    "tests/test_domain_py.py::test_noindexentry",
+    "tests/test_domain_py.py::test_optional_pyfunction_signature",
+    "tests/test_domain_py.py::test_parse_annotation",
+    "tests/test_domain_py.py::test_pyattribute",
+    "tests/test_domain_py.py::test_pyclass_options",
+    "tests/test_domain_py.py::test_pyclassmethod",
+    "tests/test_domain_py.py::test_pydata",
+    "tests/test_domain_py.py::test_pydata_signature",
+    "tests/test_domain_py.py::test_pydata_signature_old",
+    "tests/test_domain_py.py::test_pydecorator_signature",
+    "tests/test_domain_py.py::test_pydecoratormethod_signature",
+    "tests/test_domain_py.py::test_pyexception_signature",
+    "tests/test_domain_py.py::test_pyfunction",
+    "tests/test_domain_py.py::test_pyfunction_signature",
+    "tests/test_domain_py.py::test_pyfunction_signature_full",
+    "tests/test_domain_py.py::test_pymethod_options",
+    "tests/test_domain_py.py::test_pyobject_prefix",
+    "tests/test_domain_py.py::test_pystaticmethod",
+    "tests/test_domain_py.py::test_resolve_xref_for_properties",
+    "tests/test_domain_py.py::test_warn_missing_reference"
+  ],
+  "environment_setup_commit": "4b452338f914d4f6b54704222d70ae8a746e3db5"
+}

@@ -1,0 +1,46 @@
+{
+  "repo": "django/django",
+  "pull_number": 11559,
+  "instance_id": "django__django-30557",
+  "issue_numbers": [
+    "30557"
+  ],
+  "base_commit": "8c5f9906c56ac72fc4f13218dd90bdf9bc8a248b",
+  "patch": "diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py\nindex 3cab405d2df8..52ea717ca6da 100644\n--- a/django/db/models/sql/compiler.py\n+++ b/django/db/models/sql/compiler.py\n@@ -722,6 +722,8 @@ def find_ordering_name(self, name, opts, alias=None, default_order='ASC',\n \n             results = []\n             for item in opts.ordering:\n+                if hasattr(item, 'resolve_expression') and not isinstance(item, OrderBy):\n+                    item = item.desc() if descending else item.asc()\n                 if isinstance(item, OrderBy):\n                     results.append((item, False))\n                     continue\n",
+  "test_patch": "diff --git a/tests/ordering/models.py b/tests/ordering/models.py\nindex 4a3e340e71df..62df09351faf 100644\n--- a/tests/ordering/models.py\n+++ b/tests/ordering/models.py\n@@ -33,7 +33,7 @@ class Article(models.Model):\n     class Meta:\n         ordering = (\n             '-pub_date',\n-            'headline',\n+            models.F('headline'),\n             models.F('author__name').asc(),\n             OrderBy(models.F('second_author__name')),\n         )\ndiff --git a/tests/ordering/tests.py b/tests/ordering/tests.py\nindex afc8791a0550..5ee3c6032453 100644\n--- a/tests/ordering/tests.py\n+++ b/tests/ordering/tests.py\n@@ -485,7 +485,7 @@ def test_order_by_ptr_field_with_default_ordering_by_expression(self):\n     def test_deprecated_values_annotate(self):\n         msg = (\n             \"Article QuerySet won't use Meta.ordering in Django 3.1. Add \"\n-            \".order_by('-pub_date', 'headline', OrderBy(F(author__name), \"\n+            \".order_by('-pub_date', F(headline), OrderBy(F(author__name), \"\n             \"descending=False), OrderBy(F(second_author__name), \"\n             \"descending=False)) to retain the current query.\"\n         )\n",
+  "problem_statement": "order_by() a parent model crash when Meta.ordering contains expressions.\n\nDescription\n        \n\n(last modified by \nJonny Fuller\n)        \n\nHi friends,\n\nDuring testing I discovered a strange bug when using a query expression for ordering during multi-table inheritance. You can find the full write up as well as reproducible test repository \n\u200b\nhttps://github.com/JonnyWaffles/djangoordermetabug\n. The bug occurs because the field is an OrderBy object, not a string, during get_order_dir. The linked stacktrace should make the issue obvious, but what I don't understand is why it only fails during test db setup, not during repl or script use. I wish I could help more and come up with a real solution. Hopefully, this is enough for someone wiser to find the culprit.",
+  "hints_text": "See Django ticket: https://code.djangoproject.com/ticket/30557",
+  "created_at": "2019-07-11T11:18:03Z",
+  "FAIL_TO_PASS": [
+    "tests/ordering/tests.py::OrderingTests::test_deprecated_values_annotate"
+  ],
+  "PASS_TO_PASS": [
+    "tests/ordering/tests.py::OrderingTests::test_default_ordering",
+    "tests/ordering/tests.py::OrderingTests::test_default_ordering_by_f_expression",
+    "tests/ordering/tests.py::OrderingTests::test_default_ordering_override",
+    "tests/ordering/tests.py::OrderingTests::test_extra_ordering",
+    "tests/ordering/tests.py::OrderingTests::test_extra_ordering_quoting",
+    "tests/ordering/tests.py::OrderingTests::test_extra_ordering_with_table_name",
+    "tests/ordering/tests.py::OrderingTests::test_no_reordering_after_slicing",
+    "tests/ordering/tests.py::OrderingTests::test_order_by_constant_value",
+    "tests/ordering/tests.py::OrderingTests::test_order_by_constant_value_without_output_field",
+    "tests/ordering/tests.py::OrderingTests::test_order_by_f_expression",
+    "tests/ordering/tests.py::OrderingTests::test_order_by_f_expression_duplicates",
+    "tests/ordering/tests.py::OrderingTests::test_order_by_fk_attname",
+    "tests/ordering/tests.py::OrderingTests::test_order_by_nulls_first",
+    "tests/ordering/tests.py::OrderingTests::test_order_by_nulls_first_and_last",
+    "tests/ordering/tests.py::OrderingTests::test_order_by_nulls_last",
+    "tests/ordering/tests.py::OrderingTests::test_order_by_override",
+    "tests/ordering/tests.py::OrderingTests::test_order_by_pk",
+    "tests/ordering/tests.py::OrderingTests::test_order_by_ptr_field_with_default_ordering_by_expression",
+    "tests/ordering/tests.py::OrderingTests::test_orders_nulls_first_on_filtered_subquery",
+    "tests/ordering/tests.py::OrderingTests::test_random_ordering",
+    "tests/ordering/tests.py::OrderingTests::test_related_ordering_duplicate_table_reference",
+    "tests/ordering/tests.py::OrderingTests::test_reverse_meta_ordering_pure",
+    "tests/ordering/tests.py::OrderingTests::test_reverse_ordering_pure",
+    "tests/ordering/tests.py::OrderingTests::test_reversed_ordering",
+    "tests/ordering/tests.py::OrderingTests::test_stop_slicing",
+    "tests/ordering/tests.py::OrderingTests::test_stop_start_slicing"
+  ],
+  "environment_setup_commit": "8c5f9906c56ac72fc4f13218dd90bdf9bc8a248b"
+}

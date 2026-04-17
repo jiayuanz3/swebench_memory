@@ -1,0 +1,25 @@
+{
+  "repo": "psf/requests",
+  "pull_number": 1142,
+  "instance_id": "psf__requests-1144",
+  "issue_numbers": [
+    "1144"
+  ],
+  "base_commit": "22623bd8c265b78b161542663ee980738441c307",
+  "patch": "diff --git a/AUTHORS.rst b/AUTHORS.rst\nindex 124458818d..078ed993be 100644\n--- a/AUTHORS.rst\n+++ b/AUTHORS.rst\n@@ -119,3 +119,4 @@ Patches and Suggestions\n - Jonatan Heyman\n - David Bonner <dbonner@gmail.com> @rascalking\n - Vinod Chandru\n+- Johnny Goodnow <j.goodnow29@gmail.com>\ndiff --git a/requests/models.py b/requests/models.py\nindex 9926045363..4235141716 100644\n--- a/requests/models.py\n+++ b/requests/models.py\n@@ -386,13 +386,14 @@ def prepare_body(self, data, files):\n         self.body = body\n \n     def prepare_content_length(self, body):\n-        self.headers['Content-Length'] = '0'\n         if hasattr(body, 'seek') and hasattr(body, 'tell'):\n             body.seek(0, 2)\n             self.headers['Content-Length'] = str(body.tell())\n             body.seek(0, 0)\n         elif body is not None:\n             self.headers['Content-Length'] = str(len(body))\n+        elif self.method not in ('GET', 'HEAD'):\n+            self.headers['Content-Length'] = '0'\n \n     def prepare_auth(self, auth):\n         \"\"\"Prepares the given HTTP auth data.\"\"\"\n",
+  "test_patch": "diff --git a/test_requests.py b/test_requests.py\nindex c974e980de..312c955df9 100644\n--- a/test_requests.py\n+++ b/test_requests.py\n@@ -58,6 +58,13 @@ def test_basic_building(self):\n         assert pr.body == 'life=42'\n \n \n+    def test_no_content_length(self):\n+        get_req = requests.Request('GET', httpbin('get')).prepare()\n+        self.assertTrue('Content-Length' not in get_req.headers)\n+        head_req = requests.Request('HEAD', httpbin('head')).prepare()\n+        self.assertTrue('Content-Length' not in head_req.headers)\n+\n+\n     def test_path_is_not_double_encoded(self):\n         request = requests.Request('GET', \"http://0.0.0.0/get/test case\").prepare()\n \n",
+  "problem_statement": "Bad Request on some sites\n``` python\nprint requests.get('http://thepiratebay.se/recent').content\n```\n\nthe code above runs normally in requests 0.14.2\nbut, tpb returns bad request in requests 1.1.0\n\n",
+  "hints_text": "",
+  "created_at": "2013-01-25T05:19:16Z",
+  "FAIL_TO_PASS": [
+    "test_requests.py::RequestsTestCase::test_no_content_length"
+  ],
+  "PASS_TO_PASS": [
+    "test_requests.py::RequestsTestCase::test_basic_building",
+    "test_requests.py::RequestsTestCase::test_entry_points",
+    "test_requests.py::RequestsTestCase::test_invalid_url",
+    "test_requests.py::RequestsTestCase::test_params_are_added_before_fragment",
+    "test_requests.py::RequestsTestCase::test_path_is_not_double_encoded"
+  ],
+  "environment_setup_commit": "22623bd8c265b78b161542663ee980738441c307"
+}

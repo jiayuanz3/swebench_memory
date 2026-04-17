@@ -1,0 +1,29 @@
+{
+  "repo": "sphinx-doc/sphinx",
+  "pull_number": 9320,
+  "instance_id": "sphinx-doc__sphinx-14215",
+  "issue_numbers": [
+    "14215"
+  ],
+  "base_commit": "e05cef574b8f23ab1b57f57e7da6dee509a4e230",
+  "patch": "diff --git a/sphinx/cmd/quickstart.py b/sphinx/cmd/quickstart.py\nindex a40a2107310..7dfc29e192f 100644\n--- a/sphinx/cmd/quickstart.py\n+++ b/sphinx/cmd/quickstart.py\n@@ -95,6 +95,12 @@ def is_path(x: str) -> str:\n     return x\n \n \n+def is_path_or_empty(x: str) -> str:\n+    if x == '':\n+        return x\n+    return is_path(x)\n+\n+\n def allow_empty(x: str) -> str:\n     return x\n \n@@ -223,7 +229,7 @@ def ask_user(d: Dict) -> None:\n         print(__('sphinx-quickstart will not overwrite existing Sphinx projects.'))\n         print()\n         d['path'] = do_prompt(__('Please enter a new root path (or just Enter to exit)'),\n-                              '', is_path)\n+                              '', is_path_or_empty)\n         if not d['path']:\n             sys.exit(1)\n \n",
+  "test_patch": "diff --git a/tests/test_quickstart.py b/tests/test_quickstart.py\nindex 94144ef2210..02140cf0223 100644\n--- a/tests/test_quickstart.py\n+++ b/tests/test_quickstart.py\n@@ -10,6 +10,7 @@\n \n import time\n from io import StringIO\n+from os import path\n \n import pytest\n \n@@ -250,3 +251,18 @@ def test_extensions(tempdir):\n     ns = {}\n     exec(conffile.read_text(), ns)\n     assert ns['extensions'] == ['foo', 'bar', 'baz']\n+\n+\n+def test_exits_when_existing_confpy(monkeypatch):\n+    # The code detects existing conf.py with path.isfile() \n+    # so we mock it as True with pytest's monkeypatch\n+    def mock_isfile(path):\n+        return True\n+    monkeypatch.setattr(path, 'isfile', mock_isfile)\n+\n+    qs.term_input = mock_input({\n+        'Please enter a new root path (or just Enter to exit)': ''\n+    })\n+    d = {}\n+    with pytest.raises(SystemExit):\n+        qs.ask_user(d)\n",
+  "problem_statement": "sphinx-quickstart: Enter should exit when existing conf.py is detected\n## User Request\n\nBug: `sphinx-quickstart` with existing conf.py doesn't exit easily.\n\n- Running `sphinx-quickstart` in a folder with a `conf.py` already existing.\n- It says \"Please enter a new root path name (or just Enter to exit)\".\n- Pressing Enter returns an error: \"Please enter a valid path name\" (the prompt does not exit).\n\nTo Reproduce:\n```\n$ sphinx-quickstart\n$ sphinx-quickstart\n```\n\nExpected behavior:\n- After pressing Enter, sphinx-quickstart exits.\n\nEnvironment:\n- OS: Ubuntu 20.04\n- Python: 3.8.5\n- Sphinx: 3.2.1\n\n## Researcher Specification\n\nCurrent behavior and root cause:\n- In `sphinx/cmd/quickstart.py` (interactive flow `ask_user`), when an existing `conf.py` is found in the selected root path (`<root>/conf.py` or `<root>/source/conf.py`), quickstart prints an error and prompts:\n  - \"Please enter a new root path (or just Enter to exit)\"\n- The prompt uses `do_prompt(..., default='', validator=is_path)`. An empty input is rejected by `is_path('')` with the message \"Please enter a valid path name.\", causing a loop. Therefore, pressing Enter never exits.\n\nExpected behavior:\n- At the above prompt, pressing Enter should exit immediately with a non-zero status (exit code 1), without further prompting.\n- Suggested exit message: \"Found existing conf.py \u2014 aborting.\"\n- Quiet mode (`-q`) behavior remains unchanged (return 1 if unsuitable path; no prompt).\n\nEdge cases (left unchanged unless noted):\n- Detection remains limited to `<root>/conf.py` and `<root>/source/conf.py`.\n- Non-writable paths and non-Sphinx files are handled as today.\n- Symlinked `conf.py` is treated as existing.\n\nTest plan:\n- Interactive: with `<root>/conf.py` present, run `sphinx-quickstart`, press Enter at the prompt \u2192 exit code 1; message includes error and abort text.\n- Interactive: with `<root>/source/conf.py` present \u2192 same.\n- Interactive: provide a valid new path \u2192 proceed to generate in the new path; no writes to original dir.\n- Quiet mode: `sphinx-quickstart -q ... <root>` with `conf.py` \u2192 exit code 1 and existing messages.\n\nImplementation outline (no code):\n- In `ask_user`, change the prompt handling to accept empty input (Enter) and exit with code 1 when empty; otherwise, validate the provided path (directory) and continue.\n- Add or adjust tests in `tests/test_quickstart.py` to cover the above scenarios.\n\nAcceptance criteria:\n- Interactive Enter exits with code 1 and prints abort message when `conf.py` exists.\n- Quiet mode unchanged.\n- Valid new path generation unaffected.\n\n",
+  "hints_text": "",
+  "created_at": "2021-06-11T13:29:04Z",
+  "FAIL_TO_PASS": [
+    "tests/test_quickstart.py::test_exits_when_existing_confpy"
+  ],
+  "PASS_TO_PASS": [
+    "tests/test_quickstart.py::test_default_filename",
+    "tests/test_quickstart.py::test_do_prompt",
+    "tests/test_quickstart.py::test_do_prompt_inputstrip",
+    "tests/test_quickstart.py::test_do_prompt_with_nonascii",
+    "tests/test_quickstart.py::test_extensions",
+    "tests/test_quickstart.py::test_generated_files_eol",
+    "tests/test_quickstart.py::test_quickstart_all_answers",
+    "tests/test_quickstart.py::test_quickstart_and_build",
+    "tests/test_quickstart.py::test_quickstart_defaults"
+  ],
+  "environment_setup_commit": "e05cef574b8f23ab1b57f57e7da6dee509a4e230"
+}

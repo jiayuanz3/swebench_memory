@@ -1,0 +1,37 @@
+{
+  "repo": "django/django",
+  "pull_number": 10939,
+  "instance_id": "django__django-30153",
+  "issue_numbers": [
+    "30153"
+  ],
+  "base_commit": "1933e56eca1ad17de7dd133bfb7cbee9858a75a3",
+  "patch": "diff --git a/django/forms/widgets.py b/django/forms/widgets.py\nindex eed1fa5c3b18..02aa32b2078a 100644\n--- a/django/forms/widgets.py\n+++ b/django/forms/widgets.py\n@@ -48,8 +48,8 @@ def __init__(self, media=None, css=None, js=None):\n                 css = {}\n             if js is None:\n                 js = []\n-        self._css = css\n-        self._js = js\n+        self._css_lists = [css]\n+        self._js_lists = [js]\n \n     def __repr__(self):\n         return 'Media(css=%r, js=%r)' % (self._css, self._js)\n@@ -57,6 +57,25 @@ def __repr__(self):\n     def __str__(self):\n         return self.render()\n \n+    @property\n+    def _css(self):\n+        css = self._css_lists[0]\n+        # filter(None, ...) avoids calling merge with empty dicts.\n+        for obj in filter(None, self._css_lists[1:]):\n+            css = {\n+                medium: self.merge(css.get(medium, []), obj.get(medium, []))\n+                for medium in css.keys() | obj.keys()\n+            }\n+        return css\n+\n+    @property\n+    def _js(self):\n+        js = self._js_lists[0]\n+        # filter(None, ...) avoids calling merge() with empty lists.\n+        for obj in filter(None, self._js_lists[1:]):\n+            js = self.merge(js, obj)\n+        return js\n+\n     def render(self):\n         return mark_safe('\\n'.join(chain.from_iterable(getattr(self, 'render_' + name)() for name in MEDIA_TYPES)))\n \n@@ -132,11 +151,8 @@ def merge(list_1, list_2):\n \n     def __add__(self, other):\n         combined = Media()\n-        combined._js = self.merge(self._js, other._js)\n-        combined._css = {\n-            medium: self.merge(self._css.get(medium, []), other._css.get(medium, []))\n-            for medium in self._css.keys() | other._css.keys()\n-        }\n+        combined._css_lists = self._css_lists + other._css_lists\n+        combined._js_lists = self._js_lists + other._js_lists\n         return combined\n \n \n",
+  "test_patch": "diff --git a/tests/forms_tests/tests/test_media.py b/tests/forms_tests/tests/test_media.py\nindex a586da90c5ee..8cb484a15ed0 100644\n--- a/tests/forms_tests/tests/test_media.py\n+++ b/tests/forms_tests/tests/test_media.py\n@@ -541,3 +541,33 @@ def test_merge_warning(self):\n         msg = 'Detected duplicate Media files in an opposite order:\\n1\\n2'\n         with self.assertWarnsMessage(RuntimeWarning, msg):\n             self.assertEqual(Media.merge([1, 2], [2, 1]), [1, 2])\n+\n+    def test_merge_js_three_way(self):\n+        \"\"\"\n+        The relative order of scripts is preserved in a three-way merge.\n+        \"\"\"\n+        # custom_widget.js doesn't depend on jquery.js.\n+        widget1 = Media(js=['custom_widget.js'])\n+        widget2 = Media(js=['jquery.js', 'uses_jquery.js'])\n+        form_media = widget1 + widget2\n+        # The relative ordering of custom_widget.js and jquery.js has been\n+        # established (but without a real need to).\n+        self.assertEqual(form_media._js, ['custom_widget.js', 'jquery.js', 'uses_jquery.js'])\n+        # The inline also uses custom_widget.js. This time, it's at the end.\n+        inline_media = Media(js=['jquery.js', 'also_jquery.js']) + Media(js=['custom_widget.js'])\n+        merged = form_media + inline_media\n+        self.assertEqual(merged._js, ['custom_widget.js', 'jquery.js', 'uses_jquery.js', 'also_jquery.js'])\n+\n+    def test_merge_css_three_way(self):\n+        widget1 = Media(css={'screen': ['a.css']})\n+        widget2 = Media(css={'screen': ['b.css']})\n+        widget3 = Media(css={'all': ['c.css']})\n+        form1 = widget1 + widget2\n+        form2 = widget2 + widget1\n+        # form1 and form2 have a.css and b.css in different order...\n+        self.assertEqual(form1._css, {'screen': ['a.css', 'b.css']})\n+        self.assertEqual(form2._css, {'screen': ['b.css', 'a.css']})\n+        # ...but merging succeeds as the relative ordering of a.css and b.css\n+        # was never specified.\n+        merged = widget3 + form1 + form2\n+        self.assertEqual(merged._css, {'screen': ['a.css', 'b.css'], 'all': ['c.css']})\n",
+  "problem_statement": "ModelAdmin with custom widgets, inlines, and filter_horizontal can merge media in broken order\n\nDescription\nwhen a modeadmin have a inline with a filed has its own media js no need jquery , and have a one to many field show filter_horizontal, the problem appear.\nthere will be MediaOrderConflictWarning and inlines.js load before jquery.",
+  "hints_text": "See Django ticket: https://code.djangoproject.com/ticket/30153",
+  "created_at": "2019-02-05T14:02:21Z",
+  "version": "3.0",
+  "FAIL_TO_PASS": [
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_merge_css_three_way",
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_merge_js_three_way"
+  ],
+  "PASS_TO_PASS": [
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_combine_media",
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_construction",
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_form_media",
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_html_safe",
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_media_dsl",
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_media_inheritance",
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_media_inheritance_extends",
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_media_inheritance_from_property",
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_media_inheritance_single_type",
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_media_property",
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_media_property_parent_references",
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_merge",
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_merge_warning",
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_multi_media",
+    "tests/forms_tests/tests/test_media.py::FormsMediaTestCase::test_multi_widget"
+  ],
+  "environment_setup_commit": "1933e56eca1ad17de7dd133bfb7cbee9858a75a3"
+}

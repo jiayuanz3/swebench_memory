@@ -1,0 +1,48 @@
+{
+  "repo": "prometheus/prometheus",
+  "pull_number": 9515,
+  "instance_id": "prometheus__prometheus-9485",
+  "issue_numbers": [
+    "9485"
+  ],
+  "base_commit": "fdbc40a9efcc8197a94f23f0e479b0b56e52d424",
+  "patch": "diff --git a/promql/engine.go b/promql/engine.go\nindex e5dbcd2d771..5d530f34a71 100644\n--- a/promql/engine.go\n+++ b/promql/engine.go\n@@ -2085,6 +2085,8 @@ func scalarBinop(op parser.ItemType, lhs, rhs float64) float64 {\n \t\treturn btos(lhs >= rhs)\n \tcase parser.LTE:\n \t\treturn btos(lhs <= rhs)\n+\tcase parser.ATAN2:\n+\t\treturn math.Atan2(lhs, rhs)\n \t}\n \tpanic(errors.Errorf(\"operator %q not allowed for Scalar operations\", op))\n }\n",
+  "test_patch": "diff --git a/promql/testdata/operators.test b/promql/testdata/operators.test\nindex a6072eef31d..7056213c9e4 100644\n--- a/promql/testdata/operators.test\n+++ b/promql/testdata/operators.test\n@@ -481,3 +481,9 @@ eval instant at 5m trigy atan2 trigx\n \n eval instant at 5m trigy atan2 trigNaN\n     trigy{} NaN\n+\n+eval instant at 5m 10 atan2 20\n+    0.4636476090008061\n+\n+eval instant at 5m 10 atan2 NaN\n+    NaN\n",
+  "problem_statement": "`atan2` is currently not allowed between scalar values\nIn PromQL testing I noticed that `atan2` is currently not allowed between scalar values like `1 atan2 2` (`operator \"atan2\" not allowed for Scalar operations`). Is there a good reason for this? I would just treat it like any of the other arithmetic operators, which also work between scalars.\r\n\r\n_Originally posted by @juliusv in https://github.com/prometheus/prometheus/issues/9248#issuecomment-939952244_\n",
+  "hints_text": "`atan2` operates on two individual values from either side anyway (just like the other arithmetic operators), so no good reason we can't allow scalar values.\nAll that needs to be done is adding the `atan2` case from the vector binary operator switch:\r\n\r\nhttps://github.com/prometheus/prometheus/blob/f103acd5135b8bbe885b17a73dafc7bbb586319c/promql/engine.go#L2119-L2120\r\n\r\nto the scalar binary operator switch:\r\n\r\nhttps://github.com/prometheus/prometheus/blob/f103acd5135b8bbe885b17a73dafc7bbb586319c/promql/engine.go#L2062-L2087",
+  "created_at": "2021-10-15T10:50:00Z",
+  "FAIL_TO_PASS": [
+    "TestEvaluations"
+  ],
+  "PASS_TO_PASS": [
+    "TestAtModifier",
+    "TestDeriv",
+    "TestEngineEvalStmtTimestamps",
+    "TestEngineOptsValidation",
+    "TestEngineShutdown",
+    "TestFunctionList",
+    "TestIndexReuse",
+    "TestLazyLoader_WithSamplesTill",
+    "TestMMapFile",
+    "TestMaxQuerySamples",
+    "TestParseBrokenJSON",
+    "TestPreprocessAndWrapWithStepInvariantExpr",
+    "TestQueryCancel",
+    "TestQueryConcurrency",
+    "TestQueryError",
+    "TestQueryLogger_basic",
+    "TestQueryLogger_error",
+    "TestQueryLogger_fields",
+    "TestQueryLogging",
+    "TestQueryTimeout",
+    "TestRangeQuery",
+    "TestRecoverEvaluatorError",
+    "TestRecoverEvaluatorErrorWithWarnings",
+    "TestRecoverEvaluatorRuntime",
+    "TestSelectHintsSetCorrectly",
+    "TestSubquerySelector"
+  ],
+  "environment_setup_commit": "fdbc40a9efcc8197a94f23f0e479b0b56e52d424",
+  "detected_version": "1.14",
+  "actual_version": "1.26"
+}

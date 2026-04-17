@@ -1,0 +1,51 @@
+{
+  "repo": "django/django",
+  "pull_number": 11383,
+  "instance_id": "django__django-28147",
+  "issue_numbers": [
+    "28147"
+  ],
+  "base_commit": "9d6f981a66bd2c4188c4a3e08e4f36fc9c4882ef",
+  "patch": "diff --git a/AUTHORS b/AUTHORS\nindex a9d4bd435965..4487126aa335 100644\n--- a/AUTHORS\n+++ b/AUTHORS\n@@ -271,6 +271,7 @@ answer newbie questions, and generally made Django that much better:\n     Erik Karulf <erik@karulf.com>\n     Erik Romijn <django@solidlinks.nl>\n     eriks@win.tue.nl\n+    Erwin Junge <erwin@junge.nl>\n     Esdras Beleza <linux@esdrasbeleza.com>\n     Espen Grindhaug <http://grindhaug.org/>\n     Eugene Lazutkin <http://lazutkin.com/blog/>\n@@ -744,6 +745,7 @@ answer newbie questions, and generally made Django that much better:\n     Robert Wittams\n     Rob Golding-Day <rob@golding-day.com>\n     Rob Hudson <https://rob.cogit8.org/>\n+    Rob Nguyen <tienrobertnguyenn@gmail.com>\n     Robin Munn <http://www.geekforgod.com/>\n     Rodrigo Pinheiro Marques de Ara\u00fajo <fenrrir@gmail.com>\n     Romain Garrigues <romain.garrigues.cs@gmail.com>\ndiff --git a/django/db/models/base.py b/django/db/models/base.py\nindex eeb5163b9623..0d704684f14c 100644\n--- a/django/db/models/base.py\n+++ b/django/db/models/base.py\n@@ -684,14 +684,19 @@ def save(self, force_insert=False, force_update=False, using=None,\n                 # database to raise an IntegrityError if applicable. If\n                 # constraints aren't supported by the database, there's the\n                 # unavoidable risk of data corruption.\n-                if obj and obj.pk is None:\n-                    # Remove the object from a related instance cache.\n-                    if not field.remote_field.multiple:\n-                        field.remote_field.delete_cached_value(obj)\n-                    raise ValueError(\n-                        \"save() prohibited to prevent data loss due to \"\n-                        \"unsaved related object '%s'.\" % field.name\n-                    )\n+                if obj:\n+                    if obj.pk is None:\n+                        # Remove the object from a related instance cache.\n+                        if not field.remote_field.multiple:\n+                            field.remote_field.delete_cached_value(obj)\n+                        raise ValueError(\n+                            \"save() prohibited to prevent data loss due to \"\n+                            \"unsaved related object '%s'.\" % field.name\n+                        )\n+                    elif getattr(self, field.attname) is None:\n+                        # Use pk from related object if it has been saved after\n+                        # an assignment.\n+                        setattr(self, field.attname, obj.pk)\n                 # If the relationship's pk/to_field was changed, clear the\n                 # cached relationship.\n                 if obj and getattr(obj, field.target_field.attname) != getattr(self, field.attname):\ndiff --git a/django/db/models/fields/related.py b/django/db/models/fields/related.py\nindex 276bcb11ff5b..1e54bd6c6edc 100644\n--- a/django/db/models/fields/related.py\n+++ b/django/db/models/fields/related.py\n@@ -1031,6 +1031,10 @@ def save_form_data(self, instance, data):\n             setattr(instance, self.name, data)\n         else:\n             setattr(instance, self.attname, data)\n+            # Remote field object must be cleared otherwise Model.save()\n+            # will reassign attname using the related object pk.\n+            if data is None:\n+                setattr(instance, self.name, data)\n \n     def _check_unique(self, **kwargs):\n         # Override ForeignKey since check isn't applicable here.\n",
+  "test_patch": "diff --git a/tests/many_to_one/models.py b/tests/many_to_one/models.py\nindex 96b84ccddb9f..6230129bbd49 100644\n--- a/tests/many_to_one/models.py\n+++ b/tests/many_to_one/models.py\n@@ -70,6 +70,10 @@ class Child(models.Model):\n     parent = models.ForeignKey(Parent, models.CASCADE)\n \n \n+class ChildNullableParent(models.Model):\n+    parent = models.ForeignKey(Parent, models.CASCADE, null=True)\n+\n+\n class ToFieldChild(models.Model):\n     parent = models.ForeignKey(Parent, models.CASCADE, to_field='name', related_name='to_field_children')\n \ndiff --git a/tests/many_to_one/tests.py b/tests/many_to_one/tests.py\nindex 28430256dc48..7538f238f250 100644\n--- a/tests/many_to_one/tests.py\n+++ b/tests/many_to_one/tests.py\n@@ -8,8 +8,8 @@\n from django.utils.translation import gettext_lazy\n \n from .models import (\n-    Article, Category, Child, City, District, First, Parent, Record, Relation,\n-    Reporter, School, Student, Third, ToFieldChild,\n+    Article, Category, Child, ChildNullableParent, City, District, First,\n+    Parent, Record, Relation, Reporter, School, Student, Third, ToFieldChild,\n )\n \n \n@@ -522,6 +522,23 @@ def test_fk_assignment_and_related_object_cache(self):\n         self.assertIsNot(c.parent, p)\n         self.assertEqual(c.parent, p)\n \n+    def test_save_nullable_fk_after_parent(self):\n+        parent = Parent()\n+        child = ChildNullableParent(parent=parent)\n+        parent.save()\n+        child.save()\n+        child.refresh_from_db()\n+        self.assertEqual(child.parent, parent)\n+\n+    def test_save_nullable_fk_after_parent_with_to_field(self):\n+        parent = Parent(name='jeff')\n+        child = ToFieldChild(parent=parent)\n+        parent.save()\n+        child.save()\n+        child.refresh_from_db()\n+        self.assertEqual(child.parent, parent)\n+        self.assertEqual(child.parent_id, parent.name)\n+\n     def test_fk_to_bigautofield(self):\n         ch = City.objects.create(name='Chicago')\n         District.objects.create(city=ch, name='Far South')\n",
+  "problem_statement": "Saving parent object after setting on child leads to unexpected data loss\n\nDescription\n        \n\n(last modified by \nErwin Junge\n)        \n\nWhen saving a parent object after setting it on a child object and then saving the child object, no error is thrown but the FK relation is saved with a NULL value.\n\nFailing testcase:\n\n```\n        # Create parent and child, save parent, save child, parent_id should be set\n        p = Parent()\n        c = Child(parent=p)\n        p.save()\n        c.save()\n        c.refresh_from_db()\n        self.assertIs(c.parent, p)\n```\n\nPatch available: \n\u200b\nhttps://github.com/django/django/pull/8434",
+  "hints_text": "See Django ticket: https://code.djangoproject.com/ticket/28147",
+  "created_at": "2019-05-18T03:42:51Z",
+  "FAIL_TO_PASS": [
+    "tests/many_to_one/tests.py::ManyToOneTests::test_save_nullable_fk_after_parent",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_save_nullable_fk_after_parent_with_to_field"
+  ],
+  "PASS_TO_PASS": [
+    "tests/many_to_one/tests.py::ManyToOneTests::test_add",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_add_after_prefetch",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_add_then_remove_after_prefetch",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_assign",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_cached_foreign_key_with_to_field_not_cleared_by_save",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_cached_relation_invalidated_on_save",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_clear_after_prefetch",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_create",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_create_relation_with_gettext_lazy",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_deepcopy_and_circular_references",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_delete",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_explicit_fk",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_fk_assignment_and_related_object_cache",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_fk_instantiation_outside_model",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_fk_to_bigautofield",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_get",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_hasattr_related_object",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_manager_class_caching",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_multiple_foreignkeys",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_related_object",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_relation_unsaved",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_remove_after_prefetch",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_reverse_assignment_deprecation",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_reverse_foreign_key_instance_to_field_caching",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_reverse_selects",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_select_related",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_selects",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_set",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_set_after_prefetch",
+    "tests/many_to_one/tests.py::ManyToOneTests::test_values_list_exception"
+  ],
+  "environment_setup_commit": "9d6f981a66bd2c4188c4a3e08e4f36fc9c4882ef"
+}
