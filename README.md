@@ -4,6 +4,10 @@ Step1: Put your predictions in the `predictions` folder, with naming `{instance_
 
 Step2: Run 
 ```
-./evaluation.sh {run_id}
+# Run only on "lite" subset
+./evaluation.sh {run_id} lite
+
+# Run on full dataset 
+./evaluation.sh {run_id} full
 ```
-, {run_id} can be any text, e.g., test_run
+, {run_id} can be any text, e.g., my_run_id
