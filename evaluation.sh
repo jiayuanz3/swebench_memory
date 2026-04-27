@@ -47,17 +47,17 @@ echo "============================================================"
 echo ""
 
 # Ensure base Docker image exists
-if ! docker images jiayuanz3/memory:base -q | grep -q .; then
+if ! docker images jiayuanz3/swecontextbench:base -q | grep -q .; then
     echo "  → Base image not found, pulling from Docker Hub..."
-    docker pull jiayuanz3/memory:base
+    docker pull jiayuanz3/swecontextbench:base
     if [ $? -eq 0 ]; then
-        echo "  ✓ Base image found: jiayuanz3/memory:base"
+        echo "  ✓ Base image found: jiayuanz3/swecontextbench:base"
     else
         echo "  ✗ Failed to pull base image"
         exit 1
     fi
 else
-    echo "  ✓ Base image found: jiayuanz3/memory:base"
+    echo "  ✓ Base image found: jiayuanz3/swecontextbench:base"
 fi
 
 # Run evaluation

@@ -2739,13 +2739,13 @@ def find_docker_image(instance_id: str, auto_pull: bool = True) -> str:
 
     Tries the following patterns in order:
     1. sweb.simple.<instance_id with __ -> .>:latest (default SWE-bench format)
-    2. jiayuanz3/memory:<instance_id with _ and __ -> .> (user's custom format, lowercase)
+    2. jiayuanz3/swecontextbench:<instance_id with _ and __ -> .> (user's custom format, lowercase)
     3. Any image with tag matching instance_id pattern
-    4. If auto_pull=True and not found, pull from jiayuanz3/memory
+    4. If auto_pull=True and not found, pull from jiayuanz3/swecontextbench
 
     Args:
         instance_id: Instance ID (e.g., "astropy__astropy-4973")
-        auto_pull: If True, automatically pull missing images from jiayuanz3/memory
+        auto_pull: If True, automatically pull missing images from jiayuanz3/swecontextbench
 
     Returns:
         Image tag if found, None otherwise
@@ -2760,10 +2760,10 @@ def find_docker_image(instance_id: str, auto_pull: bool = True) -> str:
     if result.stdout.strip():
         return default_tag
 
-    # Pattern 2: jiayuanz3/memory format (replace __ with ., convert to lowercase)
+    # Pattern 2: jiayuanz3/swecontextbench format (replace __ with ., convert to lowercase)
     # Convert: astropy__astropy-4973 -> astropy.astropy-4973 (lowercase)
     # Docker tags are case-insensitive and typically stored in lowercase
-    memory_tag = f"jiayuanz3/memory:{instance_id.replace('__', '.').lower()}"
+    memory_tag = f"jiayuanz3/swecontextbench:{instance_id.replace('__', '.').lower()}"
     result = subprocess.run(
         ["docker", "images", "-q", memory_tag],
         capture_output=True,
@@ -2785,7 +2785,7 @@ def find_docker_image(instance_id: str, auto_pull: bool = True) -> str:
             if instance_pattern in line.lower():
                 return line.strip()
 
-    # Pattern 4: Auto-pull from jiayuanz3/memory if not found locally
+    # Pattern 4: Auto-pull from jiayuanz3/swecontextbench if not found locally
     if auto_pull:
         print(f"  → Image not found locally, pulling from Docker Hub...")
         pull_result = subprocess.run(
@@ -2896,7 +2896,7 @@ def evaluate_instance(
     if not image_tag:
         # Try to provide helpful error message
         expected_tag = f"sweb.simple.{instance_id.replace('__', '.')}:latest"
-        alt_tag = f"jiayuanz3/memory:{instance_id.replace('__', '.').lower()}"
+        alt_tag = f"jiayuanz3/swecontextbench:{instance_id.replace('__', '.').lower()}"
 
         print(f"✗ Image not found for instance: {instance_id}")
         print(f"  Expected one of:")
@@ -3086,7 +3086,7 @@ git apply /patch.diff
     if ":latest" in image_tag:
         test_patched_image = image_tag.replace(":latest", f":{run_id}_testpatch")
     else:
-        # For tags like jiayuanz3/memory:astropy.astropy-4973
+        # For tags like jiayuanz3/swecontextbench:astropy.astropy-4973
         test_patched_image = f"{image_tag}_{run_id}_testpatch"
 
     if test_patch:
@@ -3499,7 +3499,7 @@ git apply /patch.diff
     if ":latest" in image_tag:
         model_patched_image = image_tag.replace(":latest", f":{run_id}_patched")
     else:
-        # For tags like jiayuanz3/memory:astropy.astropy-4973
+        # For tags like jiayuanz3/swecontextbench:astropy.astropy-4973
         model_patched_image = f"{image_tag}_{run_id}_patched"
     container_name = f"apply_patch_{instance_id.replace('/', '_').replace('__', '_')}"
 
@@ -3693,8 +3693,8 @@ git apply /patch.diff
     subprocess.run(["docker", "rmi", model_patched_image], capture_output=True)
     execution_log.append(f"  Removed: {model_patched_image}")
 
-    # Delete instance image (but keep jiayuanz3/memory:base)
-    if image_tag != "jiayuanz3/memory:base":
+    # Delete instance image (but keep jiayuanz3/swecontextbench:base)
+    if image_tag != "jiayuanz3/swecontextbench:base":
         subprocess.run(["docker", "rmi", image_tag], capture_output=True)
         execution_log.append(f"  Removed: {image_tag}")
         print(f"  ✓ Cleaned up instance image: {image_tag}")
