@@ -18,16 +18,225 @@ Usage:
 
 import argparse
 import base64
+import hashlib
+import importlib.util
 import json
 import re
+import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 # Log directory structure (same as swebench)
 RUN_EVALUATION_LOG_DIR = Path("logs/run_evaluation")
+HARDENED_IMAGE_REPOSITORY = "jiayuanz3/swecontextbench"
+PYTHON_IMPORT_CHECK_TIMEOUT = 180
+
+
+def _safe_docker_component(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+    safe = safe.replace("__", "_").strip("_.-")
+    return safe or "x"
+
+
+def _to_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _container_name(prefix: str, instance_id: str, run_id: str) -> str:
+    run_hash = hashlib.sha1(run_id.encode("utf-8")).hexdigest()[:12]
+    name = f"{prefix}_{_safe_docker_component(instance_id)}_{run_hash}"
+    return name[:120].rstrip("_.-")
+
+
+def _temporary_image_tag(image_tag: str, run_id: str, stage: str) -> str:
+    repo, sep, source_tag = image_tag.rpartition(":")
+    if not sep or "/" in source_tag:
+        repo = image_tag
+        source_tag = "latest"
+
+    safe_stage = _safe_docker_component(stage)
+    digest = hashlib.sha1(
+        f"{image_tag}\0{run_id}\0{safe_stage}".encode("utf-8")
+    ).hexdigest()[:12]
+    suffix = f"_{digest}_{safe_stage}"
+    max_tag_len = 120
+    prefix_budget = max_tag_len - len(suffix)
+    safe_source_tag = _safe_docker_component(source_tag)[:prefix_budget].rstrip("_.-")
+    safe_source_tag = safe_source_tag or "tmp"
+    return f"{repo}:{safe_source_tag}{suffix}"
+
+
+def _diff_header_paths(line: str) -> Tuple[str | None, str | None]:
+    try:
+        parts = shlex.split(line)
+    except ValueError:
+        parts = line.split()
+    if len(parts) < 4 or parts[0] != "diff" or parts[1] != "--git":
+        return None, None
+
+    def strip_prefix(path: str, prefix: str) -> str | None:
+        if path == "/dev/null":
+            return None
+        return path.removeprefix(prefix) if path.startswith(prefix) else path
+
+    return strip_prefix(parts[2], "a/"), strip_prefix(parts[3], "b/")
+
+
+def _append_unique(paths: List[str], path: str | None) -> None:
+    if path and path not in paths:
+        paths.append(path)
+
+
+def _extract_patch_paths(patch_content: str) -> Tuple[List[str], List[str]]:
+    """Return tracked base paths and all paths touched by a unified diff."""
+    tracked_paths: List[str] = []
+    touched_paths: List[str] = []
+    section_header_paths: Tuple[str | None, str | None] = (None, None)
+    section_has_file_headers = False
+    section_is_new_file = False
+    section_is_deleted_file = False
+
+    def flush_section() -> None:
+        nonlocal section_has_file_headers
+        nonlocal section_is_new_file
+        nonlocal section_is_deleted_file
+        old_path, new_path = section_header_paths
+        if not section_has_file_headers:
+            if section_is_new_file:
+                _append_unique(touched_paths, new_path)
+            elif section_is_deleted_file:
+                _append_unique(tracked_paths, old_path)
+                _append_unique(touched_paths, old_path)
+            elif old_path != new_path:
+                _append_unique(tracked_paths, old_path)
+                _append_unique(touched_paths, old_path)
+                _append_unique(touched_paths, new_path)
+        section_has_file_headers = False
+        section_is_new_file = False
+        section_is_deleted_file = False
+
+    in_section = False
+    for line in patch_content.splitlines():
+        if line.startswith("diff --git "):
+            if in_section:
+                flush_section()
+            section_header_paths = _diff_header_paths(line)
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        if line.startswith("new file mode "):
+            section_is_new_file = True
+            continue
+        if line.startswith("deleted file mode "):
+            section_is_deleted_file = True
+            continue
+        if line.startswith("--- "):
+            section_has_file_headers = True
+            path = line[4:].strip()
+            if path.startswith("a/"):
+                _append_unique(tracked_paths, path[2:])
+                _append_unique(touched_paths, path[2:])
+            continue
+        if line.startswith("+++ "):
+            section_has_file_headers = True
+            path = line[4:].strip()
+            if path.startswith("b/"):
+                _append_unique(touched_paths, path[2:])
+
+    if in_section:
+        flush_section()
+
+    return tracked_paths, touched_paths
+
+
+def _reset_patch_paths_command(base_commit: str, paths: List[str]) -> str:
+    if not paths:
+        return ":"
+    quoted_base = shlex.quote(base_commit)
+    quoted_paths = " ".join(shlex.quote(path) for path in paths)
+    return f"""
+base_commit={quoted_base}
+for path in {quoted_paths}; do
+    if git cat-file -e "$base_commit:$path" >/dev/null 2>&1; then
+        git checkout "$base_commit" -- "$path"
+    fi
+done
+""".strip()
+
+
+def _cleanup_patch_paths_command(base_commit: str, paths: List[str]) -> str:
+    if not paths:
+        return ":"
+    quoted_base = shlex.quote(base_commit)
+    quoted_paths = " ".join(shlex.quote(path) for path in paths)
+    return f"""
+base_commit={quoted_base}
+for path in {quoted_paths}; do
+    if [ -e "$path" ] && ! git cat-file -e "$base_commit:$path" >/dev/null 2>&1; then
+        rm -rf -- "$path"
+    fi
+done
+""".strip()
+
+
+def _build_ensure_patch_apply_command(
+    test_patch: str,
+    base_commit: str,
+    infra_patches: List[str] | None = None,
+) -> Tuple[str, List[str], List[str], List[str], List[str]]:
+    tracked_paths, touched_paths = _extract_patch_paths(test_patch)
+    infra_tracked_paths: List[str] = []
+    infra_touched_paths: List[str] = []
+    for infra_patch in infra_patches or []:
+        tracked, touched = _extract_patch_paths(infra_patch)
+        for path in tracked:
+            _append_unique(infra_tracked_paths, path)
+        for path in touched:
+            _append_unique(infra_touched_paths, path)
+
+    pre_model_tracked_paths = list(dict.fromkeys(tracked_paths + infra_tracked_paths))
+    pre_model_touched_paths = list(dict.fromkeys(touched_paths + infra_touched_paths))
+    reset_pre_model_paths = _reset_patch_paths_command(
+        base_commit,
+        pre_model_tracked_paths,
+    )
+    cleanup_pre_model_paths = _cleanup_patch_paths_command(
+        base_commit,
+        pre_model_touched_paths,
+    )
+    reset_test_paths = _reset_patch_paths_command(base_commit, tracked_paths)
+    cleanup_test_paths = _cleanup_patch_paths_command(base_commit, touched_paths)
+    command = f"""
+set -euo pipefail
+cd /testbed
+echo ENSURE_PATCH_STAGE=reset_before_model
+{reset_pre_model_paths}
+{cleanup_pre_model_paths}
+echo ENSURE_PATCH_STAGE=apply_model_patch
+git apply -C1 /tmp/harbor_patches/model.patch
+echo ENSURE_PATCH_STAGE=reset_before_test_patch
+{reset_test_paths}
+{cleanup_test_paths}
+echo ENSURE_PATCH_STAGE=apply_official_test_patch
+git apply --check /tmp/harbor_patches/test.patch
+git apply /tmp/harbor_patches/test.patch
+if compgen -G "/tmp/harbor_patches/infra_*.patch" >/dev/null; then
+    for patch_file in /tmp/harbor_patches/infra_*.patch; do
+        echo "ENSURE_PATCH_STAGE=apply_infra_patch:$(basename "$patch_file")"
+        git apply "$patch_file" || echo "ENSURE_PATCH_STAGE=infra_patch_skipped:$(basename "$patch_file")"
+    done
+fi
+""".strip()
+    return command, tracked_paths, touched_paths, infra_tracked_paths, infra_touched_paths
 
 
 def _strip_unapplyable_binary_hunks(patch_content: str) -> str:
@@ -92,6 +301,7 @@ def ensure_init_files_for_new_test_dirs(
     image_tag: str,
     test_patch: str,
     instance_id: str,
+    run_id: str,
     execution_log: List[str]
 ) -> str:
     """
@@ -105,6 +315,7 @@ def ensure_init_files_for_new_test_dirs(
         image_tag: Current Docker image tag
         test_patch: The test patch content
         instance_id: Instance identifier for container naming
+        run_id: Run identifier for collision-resistant container naming
         execution_log: Log list to append messages to
 
     Returns:
@@ -133,7 +344,7 @@ if [ -d "{test_dir}" ] && [ ! -f "{test_dir}/__init__.py" ]; then \
     fi; \
 fi"""
 
-        container_name = f"check_init_{instance_id.replace('/', '_').replace('__', '_')}"
+        container_name = _container_name("check_init", instance_id, run_id)
         subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
 
         result = subprocess.run(
@@ -159,7 +370,7 @@ fi"""
         ])
         cmd = f"cd /testbed && {create_cmds}"
 
-        container_name = f"add_init_{instance_id.replace('/', '_').replace('__', '_')}"
+        container_name = _container_name("add_init", instance_id, run_id)
         subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
 
         subprocess.run(
@@ -2733,74 +2944,277 @@ def run_specific_tests_in_container(
     return status_map
 
 
-def find_docker_image(instance_id: str, auto_pull: bool = True) -> str:
+def find_docker_image(instance_id: str, auto_pull: bool = True) -> Optional[str]:
     """
-    Find Docker image for instance using multiple naming patterns
+    Find the hardened SWEContextBench Docker image for an instance.
 
-    Tries the following patterns in order:
-    1. sweb.simple.<instance_id with __ -> .>:latest (default SWE-bench format)
-    2. jiayuanz3/swecontextbench:<instance_id with _ and __ -> .> (user's custom format, lowercase)
-    3. Any image with tag matching instance_id pattern
-    4. If auto_pull=True and not found, pull from jiayuanz3/swecontextbench
-
-    Args:
-        instance_id: Instance ID (e.g., "astropy__astropy-4973")
-        auto_pull: If True, automatically pull missing images from jiayuanz3/swecontextbench
-
-    Returns:
-        Image tag if found, None otherwise
+    The evaluator intentionally does not fall back to jiayuanz3/memory. Runtime
+    and verification must use the same hardened base image.
     """
-    # Pattern 1: Default SWE-bench naming
-    default_tag = f"sweb.simple.{instance_id.replace('__', '.')}:latest"
+    image_tag = f"{HARDENED_IMAGE_REPOSITORY}:{instance_id.replace('__', '.').lower()}"
     result = subprocess.run(
-        ["docker", "images", "-q", default_tag],
+        ["docker", "images", "-q", image_tag],
         capture_output=True,
         text=True
     )
     if result.stdout.strip():
-        return default_tag
+        return image_tag
 
-    # Pattern 2: jiayuanz3/swecontextbench format (replace __ with ., convert to lowercase)
-    # Convert: astropy__astropy-4973 -> astropy.astropy-4973 (lowercase)
-    # Docker tags are case-insensitive and typically stored in lowercase
-    memory_tag = f"jiayuanz3/swecontextbench:{instance_id.replace('__', '.').lower()}"
-    result = subprocess.run(
-        ["docker", "images", "-q", memory_tag],
-        capture_output=True,
-        text=True
-    )
-    if result.stdout.strip():
-        return memory_tag
-
-    # Pattern 3: Search all images for matching tag
-    # Get all docker images and search for instance_id pattern (case-insensitive)
-    result = subprocess.run(
-        ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
-        capture_output=True,
-        text=True
-    )
-    if result.returncode == 0:
-        instance_pattern = instance_id.replace('__', '.').lower()
-        for line in result.stdout.strip().split('\n'):
-            if instance_pattern in line.lower():
-                return line.strip()
-
-    # Pattern 4: Auto-pull from jiayuanz3/swecontextbench if not found locally
     if auto_pull:
-        print(f"  → Image not found locally, pulling from Docker Hub...")
+        print(f"  → Hardened image not found locally, pulling from Docker Hub...")
         pull_result = subprocess.run(
-            ["docker", "pull", "--platform", "linux/amd64", memory_tag],
+            ["docker", "pull", "--platform", "linux/amd64", image_tag],
             capture_output=True,
             text=True
         )
         if pull_result.returncode == 0:
-            print(f"  ✓ Successfully pulled: {memory_tag}")
-            return memory_tag
+            print(f"  ✓ Successfully pulled: {image_tag}")
+            return image_tag
         else:
-            print(f"  ✗ Failed to pull image: {memory_tag}")
+            print(f"  ✗ Failed to pull hardened image: {image_tag}")
             print(f"    Error: {pull_result.stderr[:200]}")
 
     return None
+
+
+def _is_pytest_repo(repo: str) -> bool:
+    return repo.lower().replace("_", "-") == "pytest-dev/pytest"
+
+
+def _python_readiness_check_command(repo_config) -> str:
+    package_name = repo_config.get_package_name()
+    package_literal = json.dumps(package_name)
+    repo_literal = json.dumps(repo_config.repo)
+    command = (
+        "python - <<'PY'\n"
+        "import importlib\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        f"package_name = {package_literal}\n"
+        f"repo = {repo_literal}\n"
+        "try:\n"
+        "    module = importlib.import_module(package_name)\n"
+        "    if repo == 'matplotlib/matplotlib':\n"
+        "        from matplotlib import ft2font\n"
+        "        import matplotlib\n"
+        "        rc_file = Path(matplotlib.get_data_path()) / 'matplotlibrc'\n"
+        "        if not rc_file.exists():\n"
+        "            raise FileNotFoundError(f'missing matplotlibrc: {rc_file}')\n"
+        "        print(f'OK: matplotlib ft2font {getattr(ft2font, \"__file__\", \"\") or \"\"}')\n"
+        "except Exception as exc:\n"
+        "    print(f'FAILED: {type(exc).__name__}: {exc}')\n"
+        "    sys.exit(1)\n"
+        "print(f'OK: {package_name} {getattr(module, \"__file__\", \"\") or \"\"}')\n"
+        "PY"
+    )
+    if _is_pytest_repo(repo_config.repo):
+        command += "\npython -m pytest --version"
+    return command
+
+
+def _pytest_version_env_command() -> str:
+    return (
+        "PYTEST_PRETEND_VERSION=$(/opt/conda/envs/testbed/bin/python - <<'PY'\n"
+        "from pathlib import Path\n"
+        "import re\n"
+        "text = ''\n"
+        "for name in ('pyproject.toml', 'setup.cfg', 'tox.ini'):\n"
+        "    path = Path(name)\n"
+        "    if path.exists():\n"
+        "        text += '\\n' + path.read_text(errors='ignore')\n"
+        "match = re.search(r'(?im)^\\s*minversion\\s*=\\s*[\"\\']?([0-9]+(?:\\.[0-9]+){0,2})', text)\n"
+        "version = match.group(1) if match else '999.0.0'\n"
+        "parts = version.split('.')\n"
+        "while len(parts) < 3:\n"
+        "    parts.append('0')\n"
+        "print('.'.join(parts[:3]))\n"
+        "PY\n"
+        ")"
+        " && export SETUPTOOLS_SCM_PRETEND_VERSION=\"$PYTEST_PRETEND_VERSION\""
+        " && export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYTEST=\"$PYTEST_PRETEND_VERSION\""
+    )
+
+
+def _python_rebuild_command(repo_config) -> str:
+    needs_no_isolation = any(
+        repo in repo_config.repo
+        for repo in ["scikit-learn", "astropy", "matplotlib"]
+    )
+    cflags = (
+        "-Wno-error=incompatible-pointer-types"
+        if any(repo in repo_config.repo for repo in ["scikit-learn", "astropy"])
+        else ""
+    )
+    pip_flags = "--no-build-isolation" if needs_no_isolation else ""
+    build_deps = " ".join(shlex.quote(dep) for dep in repo_config.get_build_deps())
+
+    rebuild_parts = ["cd /testbed"]
+    if _is_pytest_repo(repo_config.repo):
+        rebuild_parts.append(_pytest_version_env_command())
+    if cflags:
+        rebuild_parts.append(f"export CFLAGS={shlex.quote(cflags)}")
+    if build_deps:
+        rebuild_parts.append(
+            f"/opt/conda/envs/testbed/bin/pip install {build_deps} -q 2>&1 || true"
+        )
+    rebuild_parts.append(
+        f"/opt/conda/envs/testbed/bin/pip install -e . {pip_flags} --no-deps -q 2>&1 || "
+        f"/opt/conda/envs/testbed/bin/pip install . {pip_flags} --no-deps -q 2>&1 || "
+        f"/opt/conda/envs/testbed/bin/python setup.py develop -q 2>&1"
+    )
+    return " && ".join(rebuild_parts)
+
+
+def _load_build_instance_module():
+    module_name = "_swebench_memory_harness_build_instance"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    build_instance_path = Path(__file__).with_name("build_instance.py")
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        build_instance_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Failed to load build_instance.py from {build_instance_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def ensure_python_package_ready_for_verifier(
+    *,
+    image_tag: str,
+    repo: str,
+    instance_id: str,
+    run_id: str,
+    stage: str,
+    execution_log: List[str],
+    output_log: List[str],
+    force_rebuild: bool = False,
+) -> Tuple[bool, Optional[str]]:
+    """Ensure a Python package imports inside a verifier-only temporary image."""
+    repo_config = _load_build_instance_module().RepoConfig(repo)
+    package_name = repo_config.get_package_name()
+    check_cmd = _python_readiness_check_command(repo_config)
+
+    print(f"→ Verifying Python package '{package_name}' in verifier image...")
+    execution_log.append(
+        f"\nVerifying Python package '{package_name}' in verifier image..."
+    )
+    try:
+        check_result = subprocess.run(
+            ["docker", "run", "--rm", image_tag, "bash", "-c", check_cmd],
+            capture_output=True,
+            text=True,
+            timeout=PYTHON_IMPORT_CHECK_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        check_result = subprocess.CompletedProcess(
+            exc.cmd,
+            124,
+            stdout=_to_text(exc.stdout),
+            stderr=_to_text(exc.stderr)
+            + f"\nTimed out after {PYTHON_IMPORT_CHECK_TIMEOUT}s",
+        )
+    output_log.append(f"Python import check ({stage})")
+    output_log.append(check_result.stdout)
+    output_log.append(check_result.stderr)
+
+    if check_result.returncode == 0 and not force_rebuild:
+        print(f"  ✓ Package '{package_name}' verifier-ready")
+        execution_log.append(f"  ✓ Package '{package_name}' verifier-ready")
+        return False, None
+
+    if check_result.returncode == 0:
+        print(f"  → Rebuilding package '{package_name}' for patched source...")
+        execution_log.append(
+            f"  → Rebuilding package '{package_name}' for patched source"
+        )
+    else:
+        print(f"  ⚠ Package '{package_name}' not importable; rebuilding...")
+        execution_log.append(
+            f"  ⚠ Package '{package_name}' not importable; rebuilding"
+        )
+
+    rebuild_container = _container_name(f"rebuild_{stage}", instance_id, run_id)
+    subprocess.run(["docker", "rm", "-f", rebuild_container], capture_output=True)
+    rebuild_result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--name",
+            rebuild_container,
+            image_tag,
+            "bash",
+            "-c",
+            _python_rebuild_command(repo_config),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    output_log.append(f"Python package rebuild ({stage})")
+    output_log.append(rebuild_result.stdout)
+    output_log.append(rebuild_result.stderr)
+
+    if rebuild_result.returncode != 0:
+        subprocess.run(["docker", "rm", "-f", rebuild_container], capture_output=True)
+        error = (
+            f"Verifier setup failed: package '{package_name}' rebuild returned "
+            f"{rebuild_result.returncode}"
+        )
+        print(f"  ✗ {error}")
+        execution_log.append(f"  ✗ {error}")
+        return False, error
+
+    commit_result = subprocess.run(
+        ["docker", "commit", rebuild_container, image_tag],
+        capture_output=True,
+        text=True,
+    )
+    output_log.append(commit_result.stdout)
+    output_log.append(commit_result.stderr)
+    subprocess.run(["docker", "rm", "-f", rebuild_container], capture_output=True)
+
+    if commit_result.returncode != 0:
+        error = (
+            f"Verifier setup failed: package '{package_name}' rebuild commit "
+            f"returned {commit_result.returncode}"
+        )
+        print(f"  ✗ {error}")
+        execution_log.append(f"  ✗ {error}")
+        return False, error
+
+    try:
+        recheck = subprocess.run(
+            ["docker", "run", "--rm", image_tag, "bash", "-c", check_cmd],
+            capture_output=True,
+            text=True,
+            timeout=PYTHON_IMPORT_CHECK_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        recheck = subprocess.CompletedProcess(
+            exc.cmd,
+            124,
+            stdout=_to_text(exc.stdout),
+            stderr=_to_text(exc.stderr)
+            + f"\nTimed out after {PYTHON_IMPORT_CHECK_TIMEOUT}s",
+        )
+    output_log.append(f"Python import recheck ({stage})")
+    output_log.append(recheck.stdout)
+    output_log.append(recheck.stderr)
+
+    if recheck.returncode != 0:
+        error = f"Verifier setup failed: package '{package_name}' still not verifier-ready"
+        print(f"  ✗ {error}")
+        execution_log.append(f"  ✗ {error}")
+        return True, error
+
+    print(f"  ✓ Package '{package_name}' rebuilt and verifier-ready")
+    execution_log.append(f"  ✓ Package '{package_name}' rebuilt and verifier-ready")
+    return True, None
 
 
 def compare_results(
@@ -2860,11 +3274,40 @@ def compare_results(
     return fail_to_pass_success, fail_to_pass_failure, pass_to_pass_success, pass_to_pass_failure
 
 
+def cleanup_evaluation_images(
+    test_patched_image: str,
+    model_patched_image: str,
+    image_tag: str,
+    execution_log: List[str],
+    remove_instance_image: bool = True,
+) -> None:
+    """Remove per-evaluation images while keeping reusable target images by default."""
+    execution_log.append("\nCleaning up Docker images...")
+    if test_patched_image != image_tag:
+        subprocess.run(["docker", "rmi", test_patched_image], capture_output=True)
+        execution_log.append(f"  Removed: {test_patched_image}")
+    subprocess.run(["docker", "rmi", model_patched_image], capture_output=True)
+    execution_log.append(f"  Removed: {model_patched_image}")
+
+    if image_tag == f"{HARDENED_IMAGE_REPOSITORY}:base":
+        execution_log.append(f"  Kept: {image_tag} (base image)")
+        print(f"  ✓ Kept base image: {image_tag}")
+    elif remove_instance_image:
+        subprocess.run(["docker", "rmi", image_tag], capture_output=True)
+        execution_log.append(f"  Removed: {image_tag}")
+        print(f"  ✓ Cleaned up instance image: {image_tag}")
+    else:
+        execution_log.append(f"  Kept: {image_tag} (instance image reuse)")
+        print(f"  ✓ Kept instance image for reuse: {image_tag}")
+
+
 def evaluate_instance(
     instance: dict,
     prediction: dict,
     run_id: str,
-    log_dir: Path
+    log_dir: Path,
+    remove_instance_image: bool = True,
+    ensure_patch: bool = False,
 ) -> dict:
     """Evaluate a single instance"""
     instance_id = instance['instance_id']
@@ -2887,27 +3330,28 @@ def evaluate_instance(
     execution_log.append(f"{'='*60}")
     execution_log.append(f"Evaluating instance: {instance_id}")
     execution_log.append(f"Run ID: {run_id}")
+    execution_log.append(f"Ensure patch: {ensure_patch}")
     execution_log.append(f"{'='*60}\n")
+
+    def make_container_name(prefix: str) -> str:
+        return _container_name(prefix, instance_id, run_id)
 
     # Find Docker image using smart detection
     execution_log.append(f"Searching for Docker image for instance: {instance_id}")
     image_tag = find_docker_image(instance_id)
 
     if not image_tag:
-        # Try to provide helpful error message
-        expected_tag = f"sweb.simple.{instance_id.replace('__', '.')}:latest"
-        alt_tag = f"jiayuanz3/swecontextbench:{instance_id.replace('__', '.').lower()}"
+        expected_tag = (
+            f"{HARDENED_IMAGE_REPOSITORY}:"
+            f"{instance_id.replace('__', '.').lower()}"
+        )
 
         print(f"✗ Image not found for instance: {instance_id}")
-        print(f"  Expected one of:")
-        print(f"    - {expected_tag}")
-        print(f"    - {alt_tag}")
-        print(f"    - Any image with tag containing '{instance_id.replace('__', '.').lower()}'")
+        print(f"  Expected hardened image: {expected_tag}")
 
         execution_log.append(f"ERROR: No Docker image found for {instance_id}")
-        execution_log.append(f"  Tried: {expected_tag}")
-        execution_log.append(f"  Tried: {alt_tag}")
-        error_msg = f"Image not found for instance: {instance_id}"
+        execution_log.append(f"  Expected hardened image: {expected_tag}")
+        error_msg = f"Hardened image not found for instance: {instance_id}"
 
         # Write logs before returning
         run_instance_log.write_text("\n".join(execution_log))
@@ -3082,12 +3526,39 @@ git apply /patch.diff
     output_log = []
 
     # Step 1: Apply test_patch (if exists)
-    # Create unique name for test-patched image (handle tags with or without :latest)
-    if ":latest" in image_tag:
-        test_patched_image = image_tag.replace(":latest", f":{run_id}_testpatch")
-    else:
-        # For tags like jiayuanz3/swecontextbench:astropy.astropy-4973
-        test_patched_image = f"{image_tag}_{run_id}_testpatch"
+    test_patched_image = _temporary_image_tag(image_tag, run_id, "testpatch")
+    model_patched_image = _temporary_image_tag(image_tag, run_id, "patched")
+
+    def finish_verifier_setup_failed(
+        error: str,
+        *,
+        patch_applied: bool,
+    ) -> dict:
+        print(f"✗ {error}")
+        execution_log.append(f"ERROR: {error}")
+        output_log.append(f"ERROR: {error}")
+        test_output_file.write_text("\n".join(output_log))
+        run_instance_log.write_text("\n".join(execution_log))
+        cleanup_evaluation_images(
+            test_patched_image,
+            model_patched_image,
+            image_tag,
+            execution_log,
+            remove_instance_image=remove_instance_image,
+        )
+        run_instance_log.write_text("\n".join(execution_log))
+        report = {
+            "instance_id": instance_id,
+            "resolved": False,
+            "patch_applied": patch_applied,
+            "error": error,
+            "failure_type": "verifier_setup_failed",
+        }
+        report_file.write_text(json.dumps(report, indent=2))
+        return report
+
+    test_patch_to_apply = _strip_unapplyable_binary_hunks(test_patch)
+    _had_binary_stubs_in_test = test_patch_to_apply != test_patch
 
     if test_patch:
         print(f"→ Applying test patch...")
@@ -3097,14 +3568,12 @@ git apply /patch.diff
         output_log.append("=" * 60)
 
         # Strip unapplyable binary stubs from test_patch (mirrors model_patch handling)
-        test_patch_to_apply = _strip_unapplyable_binary_hunks(test_patch)
-        _had_binary_stubs_in_test = test_patch_to_apply != test_patch
         if _had_binary_stubs_in_test:
             execution_log.append("  ⚠ Stripped unapplyable binary file stubs from test patch")
             print(f"  ⚠ Stripped unapplyable binary file stubs from test patch")
 
         cmd_apply_test = "cd /testbed && git apply -"
-        container_name = f"apply_testpatch_{instance_id.replace('/', '_').replace('__', '_')}"
+        container_name = make_container_name("apply_testpatch")
 
         subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
 
@@ -3118,11 +3587,33 @@ git apply /patch.diff
         output_log.append(result.stdout)
         output_log.append(result.stderr)
 
-        subprocess.run(
+        commit_result = subprocess.run(
             ["docker", "commit", container_name, test_patched_image],
-            capture_output=True
+            capture_output=True,
+            text=True,
         )
         subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+        output_log.append(commit_result.stdout)
+        output_log.append(commit_result.stderr)
+
+        if commit_result.returncode != 0:
+            print(f"✗ Failed to commit test-patched image")
+            execution_log.append(
+                f"ERROR: Test-patched image commit failed (code {commit_result.returncode})"
+            )
+            output_log.append("ERROR: Test-patched image commit failed")
+
+            test_output_file.write_text("\n".join(output_log))
+            run_instance_log.write_text("\n".join(execution_log))
+
+            report = {
+                "instance_id": instance_id,
+                "resolved": False,
+                "patch_applied": False,
+                "error": "Test-patched image commit failed"
+            }
+            report_file.write_text(json.dumps(report, indent=2))
+            return report
 
         # If binary stubs were stripped, try to fetch missing binary files from git remote
         if _had_binary_stubs_in_test:
@@ -3132,7 +3623,7 @@ git apply /patch.diff
             _missing_bins = _bin_pat.findall(test_patch)
             if _missing_bins:
                 print(f"  → Fetching {len(_missing_bins)} missing binary test file(s) from git remote...")
-                _fetch_container = f"fetch_binary_{instance_id.replace('/', '_').replace('__', '_')}"
+                _fetch_container = make_container_name("fetch_binary")
                 subprocess.run(["docker", "rm", "-f", _fetch_container], capture_output=True)
                 _fetch_cmd = (
                     "cd /testbed && "
@@ -3178,7 +3669,7 @@ git apply /patch.diff
                     execution_log.append(f"  → Reinstalling to include test infrastructure changes in site-packages")
 
                     reinstall_cmd = "cd /testbed && /opt/conda/envs/testbed/bin/pip install . --no-build-isolation --force-reinstall --no-deps -q"
-                    reinstall_container = f"reinstall_testpatch_{instance_id.replace('/', '_').replace('__', '_')}"
+                    reinstall_container = make_container_name("reinstall_testpatch")
                     subprocess.run(["docker", "rm", "-f", reinstall_container], capture_output=True)
 
                     reinstall_result = subprocess.run(
@@ -3200,8 +3691,8 @@ git apply /patch.diff
                     print(f"  → Reinstalling pytest in editable mode after test_patch...")
                     execution_log.append(f"  → Reinstalling pytest to regenerate version module")
 
-                    reinstall_cmd = "cd /testbed && /opt/conda/envs/testbed/bin/pip install -e . --no-deps -q"
-                    reinstall_container = f"reinstall_pytest_{instance_id.replace('/', '_').replace('__', '_')}"
+                    reinstall_cmd = _python_rebuild_command(repo_config)
+                    reinstall_container = make_container_name("reinstall_pytest")
                     subprocess.run(["docker", "rm", "-f", reinstall_container], capture_output=True)
 
                     reinstall_result = subprocess.run(
@@ -3227,6 +3718,7 @@ git apply /patch.diff
                 test_patched_image,
                 test_patch,
                 instance_id,
+                run_id,
                 execution_log
             )
 
@@ -3242,7 +3734,7 @@ git apply /patch.diff
             if 'missing' in _xarray_check.stdout:
                 print(f"  → Installing dask for xarray tests...")
                 execution_log.append("  → Installing dask for xarray test collection")
-                _dask_container = f"install_dask_{instance_id.replace('/', '_').replace('__', '_')}"
+                _dask_container = make_container_name("install_dask")
                 subprocess.run(["docker", "rm", "-f", _dask_container], capture_output=True)
                 _dask_result = subprocess.run(
                     ["docker", "run", "--name", _dask_container, test_patched_image, "bash", "-c",
@@ -3278,7 +3770,7 @@ git apply /patch.diff
                 if 'missing' in _scipy_check.stdout:
                     print(f"  → Installing scipy for sympy tests...")
                     execution_log.append("  → Installing scipy for sympy scipy tests")
-                    _scipy_container = f"install_scipy_{instance_id.replace('/', '_').replace('__', '_')}"
+                    _scipy_container = make_container_name("install_scipy")
                     subprocess.run(["docker", "rm", "-f", _scipy_container], capture_output=True)
                     _scipy_result = subprocess.run(
                         ["docker", "run", "--name", _scipy_container, test_patched_image, "bash", "-c",
@@ -3307,7 +3799,7 @@ git apply /patch.diff
                 _nvm_init = '. "$NVM_DIR/nvm.sh" 2>/dev/null || true'
                 _install_pkgs = ' '.join(f'{p}@{_solution_deps[p]}' for p in sorted(_needed))
                 _install_cmd = f'{_nvm_init} && cd /testbed && npm install --no-save {_install_pkgs} 2>&1 || true'
-                _dep_container = f"install_jsdeps_{instance_id.replace('/', '_').replace('__', '_')}"
+                _dep_container = make_container_name("install_jsdeps")
                 subprocess.run(["docker", "rm", "-f", _dep_container], capture_output=True)
                 _dep_result = subprocess.run(
                     ["docker", "run", "--name", _dep_container, test_patched_image, "bash", "-c", _install_cmd],
@@ -3322,9 +3814,43 @@ git apply /patch.diff
                     print(f"  ⚠ Test-patch dependency install failed")
                     execution_log.append(f"  ⚠ Dependency install failed: {_dep_result.stderr[:100]}")
     else:
-        # No test patch, use original image
-        test_patched_image = image_tag
-        execution_log.append("No test patch to apply")
+        print("→ No test patch; preparing verifier-only test image...")
+        execution_log.append("\nNo test patch to apply")
+        execution_log.append(
+            "Preparing verifier-only test image before setup mutations..."
+        )
+        output_log.append("=" * 60)
+        output_log.append("Preparing verifier-only test image")
+        output_log.append("=" * 60)
+
+        tag_result = subprocess.run(
+            ["docker", "tag", image_tag, test_patched_image],
+            capture_output=True,
+            text=True,
+        )
+        output_log.append(tag_result.stdout)
+        output_log.append(tag_result.stderr)
+
+        if tag_result.returncode != 0:
+            print("✗ Failed to prepare verifier-only test image")
+            execution_log.append(
+                f"ERROR: Verifier-only test image tag failed (code {tag_result.returncode})"
+            )
+            output_log.append("ERROR: Verifier-only test image tag failed")
+
+            test_output_file.write_text("\n".join(output_log))
+            run_instance_log.write_text("\n".join(execution_log))
+
+            report = {
+                "instance_id": instance_id,
+                "resolved": False,
+                "patch_applied": False,
+                "error": "Verifier-only test image tag failed",
+            }
+            report_file.write_text(json.dumps(report, indent=2))
+            return report
+
+        execution_log.append(f"  ✓ Verifier-only test image: {test_patched_image}")
 
     # Step 1.4: For Rust projects, check toolchain compatibility and fix if needed.
     # Mirrors full_validation_multilingual_rust.py's setup_version() logic.
@@ -3420,7 +3946,7 @@ git apply /patch.diff
             execution_log.append(f"  → {description}")
 
             cmd_apply_infra = "cd /testbed && git apply -"
-            container_name = f"apply_infra_{instance_id.replace('/', '_').replace('__', '_')}"
+            container_name = make_container_name("apply_infra")
 
             subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
 
@@ -3444,6 +3970,39 @@ git apply /patch.diff
                 capture_output=True
             )
             subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+
+    python_package_rebuilt_for_verify = False
+    if language == "python":
+        rebuilt, setup_error = ensure_python_package_ready_for_verifier(
+            image_tag=test_patched_image,
+            repo=repo,
+            instance_id=instance_id,
+            run_id=run_id,
+            stage="testpatch",
+            execution_log=execution_log,
+            output_log=output_log,
+        )
+        python_package_rebuilt_for_verify = rebuilt
+        if setup_error:
+            test_output_file.write_text("\n".join(output_log))
+            run_instance_log.write_text("\n".join(execution_log))
+            cleanup_evaluation_images(
+                test_patched_image,
+                model_patched_image,
+                image_tag,
+                execution_log,
+                remove_instance_image=remove_instance_image,
+            )
+            run_instance_log.write_text("\n".join(execution_log))
+            report = {
+                "instance_id": instance_id,
+                "resolved": False,
+                "patch_applied": False,
+                "error": setup_error,
+                "failure_type": "verifier_setup_failed",
+            }
+            report_file.write_text(json.dumps(report, indent=2))
+            return report
 
     # Step 2: Run tests BEFORE model patch
     print(f"→ Running tests before patch...")
@@ -3487,6 +4046,15 @@ git apply /patch.diff
             print(f"  → Fix-first fallback also returned 0 results, keeping empty baseline")
             execution_log.append(f"  → Fix-first fallback also returned 0 results")
 
+    if language == "python" and all_tests and len(tests_before) == 0:
+        return finish_verifier_setup_failed(
+            (
+                "Verifier setup failed: collected 0 tests before patch "
+                f"for {instance_id}; expected {len(all_tests)} requested tests"
+            ),
+            patch_applied=False,
+        )
+
     # Step 3: Apply model patch
     print(f"→ Applying model patch...")
     execution_log.append("\nApplying model patch...")
@@ -3494,36 +4062,118 @@ git apply /patch.diff
     output_log.append("Applying model patch")
     output_log.append("=" * 60)
 
-    cmd_apply_model = "cd /testbed && git apply -C1 -"
-    # Create unique name for model-patched image (handle tags with or without :latest)
-    if ":latest" in image_tag:
-        model_patched_image = image_tag.replace(":latest", f":{run_id}_patched")
-    else:
-        # For tags like jiayuanz3/swecontextbench:astropy.astropy-4973
-        model_patched_image = f"{image_tag}_{run_id}_patched"
-    container_name = f"apply_patch_{instance_id.replace('/', '_').replace('__', '_')}"
+    container_name = make_container_name("apply_patch")
 
     subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
 
-    result = subprocess.run(
-        ["docker", "run", "-i", "--name", container_name, test_patched_image, "bash", "-c", cmd_apply_model],
-        input=model_patch,
-        capture_output=True,
-        text=True
-    )
+    if ensure_patch and test_patch:
+        (
+            cmd_apply_model,
+            tracked_test_paths,
+            touched_test_paths,
+            tracked_infra_paths,
+            touched_infra_paths,
+        ) = _build_ensure_patch_apply_command(
+            test_patch_to_apply,
+            base_commit,
+            [patch_content for _, patch_content in infra_fixes],
+        )
+        _, model_touched_paths = _extract_patch_paths(model_patch)
+        overlap_paths = sorted(set(model_touched_paths) & set(touched_test_paths))
+        infra_overlap_paths = sorted(
+            set(model_touched_paths) & set(touched_infra_paths)
+        )
+        execution_log.append(
+            "  → ensure_patch enabled: "
+            f"reset_paths={len(tracked_test_paths)}, "
+            f"cleanup_paths={len(touched_test_paths)}, "
+            f"infra_reset_paths={len(tracked_infra_paths)}, "
+            f"infra_cleanup_paths={len(touched_infra_paths)}, "
+            f"overlap_paths={len(overlap_paths)}, "
+            f"infra_overlap_paths={len(infra_overlap_paths)}"
+        )
+        if overlap_paths:
+            execution_log.append(
+                "  → ensure_patch overlap paths: " + ", ".join(overlap_paths[:20])
+            )
+            if len(overlap_paths) > 20:
+                execution_log.append(
+                    f"  → ensure_patch overlap paths truncated: {len(overlap_paths) - 20} more"
+                )
+        if infra_overlap_paths:
+            execution_log.append(
+                "  → ensure_patch infra overlap paths: "
+                + ", ".join(infra_overlap_paths[:20])
+            )
+            if len(infra_overlap_paths) > 20:
+                execution_log.append(
+                    f"  → ensure_patch infra overlap paths truncated: {len(infra_overlap_paths) - 20} more"
+                )
+
+        with tempfile.TemporaryDirectory(prefix="harbor-ensure-patch-") as patch_dir:
+            patch_dir_path = Path(patch_dir)
+            (patch_dir_path / "model.patch").write_text(model_patch, encoding="utf-8")
+            (patch_dir_path / "test.patch").write_text(
+                test_patch_to_apply,
+                encoding="utf-8",
+            )
+            for index, (_, infra_patch) in enumerate(infra_fixes):
+                (patch_dir_path / f"infra_{index:03d}.patch").write_text(
+                    infra_patch,
+                    encoding="utf-8",
+                )
+            result = subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "--name",
+                    container_name,
+                    "-v",
+                    f"{patch_dir_path.resolve()}:/tmp/harbor_patches:ro",
+                    test_patched_image,
+                    "bash",
+                    "-c",
+                    cmd_apply_model,
+                ],
+                capture_output=True,
+                text=True,
+            )
+    else:
+        cmd_apply_model = "cd /testbed && git apply -C1 -"
+        result = subprocess.run(
+            [
+                "docker",
+                "run",
+                "-i",
+                "--name",
+                container_name,
+                test_patched_image,
+                "bash",
+                "-c",
+                cmd_apply_model,
+            ],
+            input=model_patch,
+            capture_output=True,
+            text=True,
+        )
 
     output_log.append(result.stdout)
     output_log.append(result.stderr)
 
-    subprocess.run(
+    commit_result = subprocess.run(
         ["docker", "commit", container_name, model_patched_image],
-        capture_output=True
+        capture_output=True,
+        text=True,
     )
     subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+    output_log.append(commit_result.stdout)
+    output_log.append(commit_result.stderr)
 
     if result.returncode != 0:
         print(f"✗ Failed to apply model patch")
         execution_log.append(f"ERROR: Model patch failed to apply (code {result.returncode})")
+        if ensure_patch and test_patch:
+            execution_log.append("ERROR: ensure_patch pipeline failed; see test_output.txt for stage output")
         output_log.append("ERROR: Patch failed to apply")
 
         # Write logs
@@ -3531,14 +4181,48 @@ git apply /patch.diff
         run_instance_log.write_text("\n".join(execution_log))
 
         # Clean up
-        if test_patched_image != image_tag:
-            subprocess.run(["docker", "rmi", test_patched_image], capture_output=True)
+        cleanup_evaluation_images(
+            test_patched_image,
+            model_patched_image,
+            image_tag,
+            execution_log,
+            remove_instance_image=remove_instance_image,
+        )
+        run_instance_log.write_text("\n".join(execution_log))
 
         report = {
             "instance_id": instance_id,
             "resolved": False,
             "patch_applied": False,
             "error": "Patch failed"
+        }
+        report_file.write_text(json.dumps(report, indent=2))
+        return report
+
+    if commit_result.returncode != 0:
+        print(f"✗ Failed to commit model-patched image")
+        execution_log.append(
+            f"ERROR: Model-patched image commit failed (code {commit_result.returncode})"
+        )
+        output_log.append("ERROR: Model-patched image commit failed")
+
+        test_output_file.write_text("\n".join(output_log))
+        run_instance_log.write_text("\n".join(execution_log))
+
+        cleanup_evaluation_images(
+            test_patched_image,
+            model_patched_image,
+            image_tag,
+            execution_log,
+            remove_instance_image=remove_instance_image,
+        )
+        run_instance_log.write_text("\n".join(execution_log))
+
+        report = {
+            "instance_id": instance_id,
+            "resolved": False,
+            "patch_applied": False,
+            "error": "Model-patched image commit failed"
         }
         report_file.write_text(json.dumps(report, indent=2))
         return report
@@ -3559,7 +4243,7 @@ git apply /patch.diff
             execution_log.append(f"  → Reinstalling to incorporate code changes in site-packages")
 
             reinstall_cmd = "cd /testbed && /opt/conda/envs/testbed/bin/pip install . --no-build-isolation --force-reinstall --no-deps -q"
-            reinstall_container = f"reinstall_modelpatch_{instance_id.replace('/', '_').replace('__', '_')}"
+            reinstall_container = make_container_name("reinstall_modelpatch")
             subprocess.run(["docker", "rm", "-f", reinstall_container], capture_output=True)
 
             reinstall_result = subprocess.run(
@@ -3575,13 +4259,48 @@ git apply /patch.diff
 
             subprocess.run(["docker", "rm", "-f", reinstall_container], capture_output=True)
 
+        if python_package_rebuilt_for_verify:
+            rebuilt, setup_error = ensure_python_package_ready_for_verifier(
+                image_tag=model_patched_image,
+                repo=repo,
+                instance_id=instance_id,
+                run_id=run_id,
+                stage="modelpatch",
+                execution_log=execution_log,
+                output_log=output_log,
+                force_rebuild=True,
+            )
+            if setup_error:
+                test_output_file.write_text("\n".join(output_log))
+                run_instance_log.write_text("\n".join(execution_log))
+                cleanup_evaluation_images(
+                    test_patched_image,
+                    model_patched_image,
+                    image_tag,
+                    execution_log,
+                    remove_instance_image=remove_instance_image,
+                )
+                run_instance_log.write_text("\n".join(execution_log))
+                report = {
+                    "instance_id": instance_id,
+                    "resolved": False,
+                    "patch_applied": True,
+                    "error": setup_error,
+                    "failure_type": "verifier_setup_failed",
+                }
+                report_file.write_text(json.dumps(report, indent=2))
+                return report
+            python_package_rebuilt_for_verify = (
+                python_package_rebuilt_for_verify or rebuilt
+            )
+
     # For JavaScript projects: rebuild after model_patch so the compiled output
     # (dist/) reflects the patched source.  Karma tests run the built bundle,
     # not the raw source, so skipping the rebuild means the fix never takes effect.
     if language == "javascript":
         nvm_init = '. "$NVM_DIR/nvm.sh" 2>/dev/null || true'
         rebuild_cmd = f"{nvm_init} && cd /testbed && npm run build 2>&1 || true"
-        rebuild_container = f"rebuild_js_{instance_id.replace('/', '_').replace('__', '_')}"
+        rebuild_container = make_container_name("rebuild_js")
         subprocess.run(["docker", "rm", "-f", rebuild_container], capture_output=True)
 
         rebuild_result = subprocess.run(
@@ -3616,6 +4335,15 @@ git apply /patch.diff
 
     print(f"  ✓ Ran {len(tests_after)} test(s)")
     execution_log.append(f"  ✓ Collected {len(tests_after)} test results")
+
+    if language == "python" and all_tests and len(tests_after) == 0:
+        return finish_verifier_setup_failed(
+            (
+                "Verifier setup failed: collected 0 tests after patch "
+                f"for {instance_id}; expected {len(all_tests)} requested tests"
+            ),
+            patch_applied=True,
+        )
 
     # Step 5: Compare results
     execution_log.append("\nComparing test results...")
@@ -3685,22 +4413,13 @@ git apply /patch.diff
     report_file.write_text(json.dumps(report, indent=2))
     execution_log.append(f"✓ Report written to {report_file}")
 
-    # Clean up images
-    execution_log.append("\nCleaning up Docker images...")
-    if test_patched_image != image_tag:
-        subprocess.run(["docker", "rmi", test_patched_image], capture_output=True)
-        execution_log.append(f"  Removed: {test_patched_image}")
-    subprocess.run(["docker", "rmi", model_patched_image], capture_output=True)
-    execution_log.append(f"  Removed: {model_patched_image}")
-
-    # Delete instance image (but keep jiayuanz3/swecontextbench:base)
-    if image_tag != "jiayuanz3/swecontextbench:base":
-        subprocess.run(["docker", "rmi", image_tag], capture_output=True)
-        execution_log.append(f"  Removed: {image_tag}")
-        print(f"  ✓ Cleaned up instance image: {image_tag}")
-    else:
-        execution_log.append(f"  Kept: {image_tag} (base image)")
-        print(f"  ✓ Kept base image: {image_tag}")
+    cleanup_evaluation_images(
+        test_patched_image,
+        model_patched_image,
+        image_tag,
+        execution_log,
+        remove_instance_image=remove_instance_image,
+    )
 
     # Write execution log
     execution_log.append(f"\n{'='*60}")
@@ -3732,6 +4451,24 @@ def main():
         type=str,
         required=True,
         help="Run ID for this evaluation"
+    )
+    parser.add_argument(
+        "--no-remove-instance-image",
+        dest="remove_instance_image",
+        action="store_false",
+        default=True,
+        help=(
+            "Keep the original instance image after evaluation. By default the "
+            "instance image is removed after evaluation."
+        ),
+    )
+    parser.add_argument(
+        "--ensure-patch",
+        action="store_true",
+        help=(
+            "Before applying the model patch, reset and clean official test-patch "
+            "paths, then reapply the official test patch after the model patch."
+        ),
     )
 
     args = parser.parse_args()
@@ -3783,7 +4520,14 @@ def main():
         # Create log directory: logs/run_evaluation/{run_id}/{model_name}/{instance_id}/
         log_dir = RUN_EVALUATION_LOG_DIR / args.run_id / model_name / instance_id
 
-        result = evaluate_instance(instance, prediction, args.run_id, log_dir)
+        result = evaluate_instance(
+            instance,
+            prediction,
+            args.run_id,
+            log_dir,
+            remove_instance_image=args.remove_instance_image,
+            ensure_patch=args.ensure_patch,
+        )
         results.append(result)
 
         if result.get('resolved', False):
