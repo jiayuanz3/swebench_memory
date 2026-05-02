@@ -10,7 +10,7 @@ SWE-ContextBench dataset can be downloaded from [Hugging Face](https://huggingfa
  <div align="center"><img width="880" height="400" src="https://github.com/jiayuanz3/SWEContextBench/blob/main/assets/cover_image.png"></div>
 
 ## Run Evaluation
-We provide pre-built [Docker images](https://hub.docker.com/r/jiayuanz3/memory/tags) for the related tasks.
+We provide pre-built [Docker images](https://hub.docker.com/r/jiayuanz3/swecontextbench/tags) for the related tasks.
 
 Step1: Put your predictions in the `predictions` folder, with naming `{instance_id}_preds.json`
 
